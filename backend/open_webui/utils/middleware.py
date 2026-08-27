@@ -86,6 +86,11 @@ from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import compact_messages_for_request
+from open_webui.utils.thread_context import (
+    assemble_thread_context,
+    assemble_thread_context_with_prefix,
+    own_history_is_first_exchange,
+)
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -1706,6 +1711,23 @@ async def get_image_urls(delta_images, request, metadata, user) -> list[str]:
     return image_urls
 
 
+async def get_stored_context_messages(chat) -> list:
+    """Stored-message chain that mirrors the LLM payload for ``chat``.
+
+    Normal chats: the chat's own live history chain. Thread chats
+    (``parent_chat_id`` set): the assembled thread context (frozen ancestor
+    segments up to each branch point + the thread's own chain), so file tags
+    pair against the same chain the payload was built from and files
+    referenced by inherited ancestor messages resolve into context. Ancestor
+    files are read from each ancestor's own history (scoped to that
+    ancestor's chat id) by assemble_thread_context.
+    """
+    history = chat.chat.get('history', {})
+    if getattr(chat, 'parent_chat_id', None):
+        return await assemble_thread_context(chat, history.get('currentId'), chat.user_id)
+    return get_message_list(history.get('messages', {}), history.get('currentId'))
+
+
 async def add_file_context(messages: list, chat_id: str, user) -> list:
     """
     Add file URLs to messages for native function calling.
@@ -1717,8 +1739,7 @@ async def add_file_context(messages: list, chat_id: str, user) -> list:
     if not chat:
         return messages
 
-    history = chat.chat.get('history', {})
-    stored_messages = get_message_list(history.get('messages', {}), history.get('currentId'))
+    stored_messages = await get_stored_context_messages(chat)
 
     def format_file_tag(file):
         # Every file reaching here has a url or a chat id, so id is always set.
@@ -2157,11 +2178,30 @@ async def convert_url_images_to_base64(form_data, user=None):
 MESSAGE_REPLAY_KEYS = ('id', 'role', 'content', 'output', 'files', 'contextSummary', 'usage', 'model')
 
 
-async def load_messages_from_db(chat_id: str, message_id: str) -> Optional[list[dict]]:
+async def load_messages_from_db(chat_id: str, message_id: str, metadata: dict | None = None) -> Optional[list[dict]]:
     """
     Load the message chain from DB up to message_id,
     keeping only fields needed to rebuild the LLM payload.
+
+    Thread chats (``parent_chat_id`` set) instead get the assembled thread
+    context: each ancestor's frozen chain up to its branch point, then the
+    thread's own chain to message_id. Hooking here (KTD2) covers both call
+    sites — process_chat_payload and the tool-approval resume path
+    drain_approved_tool_calls. The thread result is shape-identical to the
+    normal path (same MESSAGE_REPLAY_KEYS projection; inherited segments
+    additionally have contextSummary stripped). When ``metadata`` is given,
+    the inherited-prefix length is recorded under
+    ``metadata['thread_inherited_message_count']`` so context compaction can
+    keep the inherited prefix uncompacted and scope its boundary (and
+    checkpoint upserts) to the thread's own messages.
     """
+    chat = await Chats.get_chat_by_id(chat_id)
+    if chat is not None and getattr(chat, 'parent_chat_id', None):
+        db_messages, inherited_count = await assemble_thread_context_with_prefix(chat, message_id, chat.user_id)
+        if metadata is not None:
+            metadata['thread_inherited_message_count'] = inherited_count
+        return db_messages or None
+
     messages_map = await Chats.get_messages_map_by_chat_id(chat_id)
     if not messages_map:
         return None
@@ -2412,7 +2452,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     user_message_id = metadata.get('user_message_id')
 
     if is_saved_chat_id(chat_id) and user_message_id:
-        db_messages = await load_messages_from_db(chat_id, user_message_id)
+        db_messages = await load_messages_from_db(chat_id, user_message_id, metadata)
         if db_messages:
             # Continue: frontend sends assistant_message_id when continuing
             # an existing response. Load its content so the LLM sees prior output.
@@ -3366,7 +3406,7 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
                 }
             )
 
-        db_messages = await load_messages_from_db(chat_id, metadata.get('user_message_id'))
+        db_messages = await load_messages_from_db(chat_id, metadata.get('user_message_id'), metadata)
         if db_messages:
             assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, message_id)
             if assistant_message:
@@ -3767,7 +3807,12 @@ async def background_tasks_handler(ctx):
                                 }
                             )
 
-                    if title == None and len(messages) == 2 and (not messages_map or len(messages_map) <= 2):
+                    # New-chat fallback gated on the chat's OWN history counts
+                    # (messages/messages_map are built from this chat's own row
+                    # above, never the flattened thread context), so a thread's
+                    # first exchange still titles even with a long inherited
+                    # prefix.
+                    if title == None and own_history_is_first_exchange(messages, messages_map):
                         title = messages[0].get('content', user_message)
 
                         await Chats.update_chat_title_by_id(metadata['chat_id'], title)

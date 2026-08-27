@@ -129,6 +129,35 @@ def build_thread_context(
     return context
 
 
+def split_inherited_prefix(messages: list, inherited_count: Any) -> tuple[list, list]:
+    """Split a flattened thread payload into (inherited_prefix, own_messages).
+
+    ``inherited_count`` is the value recorded by the completion pipeline
+    (``metadata['thread_inherited_message_count']``); it is untrusted here and
+    clamped to ``[0, len(messages)]``, with any non-numeric value treated as 0
+    so a normal chat (no thread metadata) always yields an empty prefix.
+    """
+    messages = messages or []
+    try:
+        count = int(inherited_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    count = max(0, min(count, len(messages)))
+    return messages[:count], messages[count:]
+
+
+def own_history_is_first_exchange(own_messages: list, own_messages_map: Optional[dict]) -> bool:
+    """True when a chat's OWN history is exactly its first user/assistant pair.
+
+    Used by the new-chat title fallback in
+    ``open_webui/utils/middleware.py``. Both arguments must come from the
+    chat's own row (its own message chain and message map) — never from the
+    flattened post-inheritance payload — so a young thread with a long
+    inherited prefix still gets an auto-generated title.
+    """
+    return len(own_messages or []) == 2 and (not own_messages_map or len(own_messages_map) <= 2)
+
+
 async def assemble_thread_context(
     chat: Any,
     target_message_id: Optional[str],
@@ -138,6 +167,31 @@ async def assemble_thread_context(
     get_chat=None,
     get_messages_map=None,
 ) -> list[dict]:
+    """Resolve a thread's full model context, inherited segments included.
+
+    Thin wrapper over :func:`assemble_thread_context_with_prefix` that drops
+    the inherited-prefix length.
+    """
+    context, _ = await assemble_thread_context_with_prefix(
+        chat,
+        target_message_id,
+        user_id,
+        max_depth=max_depth,
+        get_chat=get_chat,
+        get_messages_map=get_messages_map,
+    )
+    return context
+
+
+async def assemble_thread_context_with_prefix(
+    chat: Any,
+    target_message_id: Optional[str],
+    user_id: Optional[str] = None,
+    *,
+    max_depth: int = MAX_THREAD_DEPTH,
+    get_chat=None,
+    get_messages_map=None,
+) -> tuple[list[dict], int]:
     """Resolve a thread's full model context, inherited segments included.
 
     Walks ``parent_chat_id`` from ``chat`` up toward the root (visited-set
@@ -160,6 +214,10 @@ async def assemble_thread_context(
         defaults to ``Chats.get_chat_by_id``.
     :param get_messages_map: ``async (chat_id) -> dict | None`` override
         (tests); defaults to ``Chats.get_messages_map_by_chat_id``.
+    :return: ``(context, inherited_count)`` where ``context[:inherited_count]``
+        is the inherited ancestor prefix and the remainder is the thread's own
+        chain. The completion pipeline records ``inherited_count`` so
+        compaction can scope its boundary to the thread's own messages.
     """
     if get_chat is None or get_messages_map is None:
         # Imported lazily: pulling in the models layer at module import time
@@ -228,4 +286,8 @@ async def assemble_thread_context(
     if target_message_id is not None:
         own_messages_map = await get_messages_map(getattr(chat, 'id', None))
 
-    return build_thread_context(ancestor_segments, (own_messages_map or {}, target_message_id))
+    # Built in two passes (equivalent to one build_thread_context call over
+    # both segments) so the inherited-prefix length is known exactly.
+    inherited_context = build_thread_context(ancestor_segments, ({}, None))
+    own_context = build_thread_context([], (own_messages_map or {}, target_message_id))
+    return [*inherited_context, *own_context], len(inherited_context)

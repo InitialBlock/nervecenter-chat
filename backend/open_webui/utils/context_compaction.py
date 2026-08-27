@@ -16,6 +16,7 @@ from open_webui.utils.task import (
     replace_messages_variable,
     replace_prompt_variable,
 )
+from open_webui.utils.thread_context import split_inherited_prefix
 
 log = logging.getLogger(__name__)
 
@@ -55,16 +56,35 @@ async def compact_messages_for_request(
     system_messages = [messages[0]] if messages and messages[0].get('role') == 'system' else []
     messages = messages[1:] if system_messages else messages
 
+    # Thread chats: the inherited ancestor prefix (assembled by
+    # load_messages_from_db, which records its length in metadata) passes
+    # through uncompacted, and everything below — checkpoint application,
+    # boundary, summary, checkpoint upsert — operates on the thread's OWN
+    # messages only, so contextSummary checkpoints are always written to a
+    # message id in the thread's own row, never an ancestor's. Inherited
+    # messages arrive with contextSummary stripped (thread_context projection),
+    # so they could not carry a checkpoint anyway. Normal chats have an empty
+    # prefix and take the exact pre-existing path.
+    inherited_prefix, messages = split_inherited_prefix(
+        messages, (metadata or {}).get('thread_inherited_message_count')
+    )
+
     messages, previous_summary = _apply_latest_summary_checkpoint(messages)
     token_threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
-    if not _exceeds_token_threshold(messages, system_prompt, previous_summary, token_threshold) or len(messages) <= 3:
-        return [*system_messages, *messages], previous_summary, False
+    # Threshold counts the full payload (prefix included) since the model sees
+    # all of it; the <= 3 short-circuit counts own messages only, because only
+    # those are compactable.
+    if (
+        not _exceeds_token_threshold([*inherited_prefix, *messages], system_prompt, previous_summary, token_threshold)
+        or len(messages) <= 3
+    ):
+        return [*system_messages, *inherited_prefix, *messages], previous_summary, False
 
     boundary = _find_compaction_boundary(messages, config['retention_percentage'])
     compacted_messages = messages[:boundary]
     recent_messages = messages[boundary:]
     if not compacted_messages or not recent_messages:
-        return [*system_messages, *messages], previous_summary, False
+        return [*system_messages, *inherited_prefix, *messages], previous_summary, False
 
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
@@ -144,7 +164,7 @@ async def compact_messages_for_request(
             }
         )
 
-    return [*system_messages, *recent_messages], summary, True
+    return [*system_messages, *inherited_prefix, *recent_messages], summary, True
 
 
 async def compact_chat_branch(request, user, chat: Any, model_id: str, models: dict) -> dict:
