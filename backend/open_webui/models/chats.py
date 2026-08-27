@@ -192,6 +192,24 @@ def is_internal_chat(meta: dict | None) -> bool:
     return bool(meta and meta.get('internal') is True)
 
 
+def visible_chat_filter():
+    """SQLAlchemy criterion selecting chats that belong on normal listing surfaces.
+
+    Excludes internal chats (``meta.internal`` is true) and thread chats
+    (``parent_chat_id`` is set). Apply this to every user-facing listing/count
+    site (sidebar lists, pinned, archived, folders, tags, unread) instead of
+    composing the internal-chat exclusion inline (KTD5).
+
+    Deliberately NOT applied to search (``get_chats_by_user_id_and_search_text``
+    keeps its own inline internal filter so thread messages stay searchable, R14)
+    or to admin/all-chats paths.
+    """
+    return and_(
+        Chat.meta['internal'].as_boolean().is_not(True),
+        Chat.parent_chat_id.is_(None),
+    )
+
+
 class ChatModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)  # allows ORM model binding
     id: str
@@ -826,7 +844,7 @@ class ChatTable:
                     Chat.user_id == user_id,
                     Chat.folder_id.in_(folder_ids),
                     Chat.archived == False,
-                    Chat.meta['internal'].as_boolean().is_not(True),
+                    visible_chat_filter(),
                 )
                 .values(last_read_at=Chat.updated_at)
             )
@@ -840,7 +858,7 @@ class ChatTable:
                 .where(
                     Chat.user_id == user_id,
                     Chat.archived == False,
-                    Chat.meta['internal'].as_boolean().is_not(True),
+                    visible_chat_filter(),
                 )
                 .values(last_read_at=Chat.updated_at)
             )
@@ -1420,7 +1438,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at).filter_by(
                 user_id=user_id, archived=True
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
 
             if filter:
                 query_key = filter.get('query')
@@ -1469,7 +1487,7 @@ class ChatTable:
     ) -> int:
         async with get_async_db_context(db) as session:
             stmt = select(func.count(Chat.id)).filter_by(user_id=user_id, archived=True)
-            result = await session.execute(stmt.where(Chat.meta['internal'].as_boolean().is_not(True)))
+            result = await session.execute(stmt.where(visible_chat_filter()))
             return result.scalar() or 0
 
     async def get_shared_chat_list_by_user_id(
@@ -1498,7 +1516,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             if not include_archived:
                 stmt = stmt.filter_by(archived=False)
 
@@ -1556,7 +1574,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
 
             if not include_folders:
                 stmt = stmt.filter_by(folder_id=None)
@@ -1599,7 +1617,7 @@ class ChatTable:
     ) -> list[ChatModel]:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).filter(Chat.id.in_(chat_ids)).filter_by(archived=False)
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
             all_chats = result.scalars().all()
             return [ChatModel.model_validate(chat) for chat in all_chats]
@@ -1836,6 +1854,7 @@ class ChatTable:
                     Chat.archived == False,
                     Chat.updated_at > func.coalesce(Chat.last_read_at, 0),
                     ~unfinished_assistant,
+                    visible_chat_filter(),
                 )
                 .group_by(Chat.folder_id)
             )
@@ -1889,7 +1908,7 @@ class ChatTable:
     ) -> ChatListResponse:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).filter_by(user_id=user_id)
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
 
             if filter:
                 if filter.get('updated_at'):
@@ -1936,7 +1955,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id, pinned=True, archived=False
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
             all_chats = result.all()
             return [
@@ -1955,7 +1974,7 @@ class ChatTable:
     async def get_archived_chats_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> list[ChatModel]:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).filter_by(user_id=user_id, archived=True)
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
             return [ChatModel.model_validate(chat) for chat in result.scalars().all()]
 
@@ -2168,7 +2187,7 @@ class ChatTable:
                 .filter_by(folder_id=folder_id, user_id=user_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
             )
             stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir))
 
@@ -2209,7 +2228,7 @@ class ChatTable:
                 .filter_by(folder_id=folder_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
             )
             stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir, unread_for_user_id))
 
@@ -2243,7 +2262,7 @@ class ChatTable:
                 .filter_by(folder_id=folder_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
             )
             result = await session.execute(stmt)
             return result.scalar_one()
@@ -2257,7 +2276,7 @@ class ChatTable:
                 .filter(Chat.folder_id.in_(folder_ids), Chat.user_id == user_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
                 .order_by(Chat.updated_at.desc())
             )
 
@@ -2307,7 +2326,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             tag_id = tag_name.replace(' ', '_').lower()
 
             bind = await session.connection()
@@ -2390,7 +2409,7 @@ class ChatTable:
             for index, tag_id in enumerate(tag_ids):
                 tag_id = tag_id.replace(' ', '_').lower()
                 stmt = select(func.count(Chat.id)).filter_by(user_id=user_id, archived=False)
-                stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+                stmt = stmt.where(visible_chat_filter())
                 param = f'tag_id_{index}'
                 if dialect_name == 'sqlite':
                     stmt = stmt.filter(
@@ -2436,7 +2455,7 @@ class ChatTable:
     ) -> int:
         async with get_async_db_context(db) as session:
             stmt = select(func.count(Chat.id)).filter_by(user_id=user_id, folder_id=folder_id)
-            result = await session.execute(stmt.where(Chat.meta['internal'].as_boolean().is_not(True)))
+            result = await session.execute(stmt.where(visible_chat_filter()))
             count = result.scalar()
 
             log.info("Count of chats for folder '%s': %s", folder_id, count)
@@ -2450,7 +2469,7 @@ class ChatTable:
 
         async with get_async_db_context(db) as session:
             stmt = select(func.count(Chat.id)).filter(Chat.user_id == user_id, Chat.folder_id.in_(folder_ids))
-            result = await session.execute(stmt.where(Chat.meta['internal'].as_boolean().is_not(True)))
+            result = await session.execute(stmt.where(visible_chat_filter()))
             count = result.scalar()
 
             log.info("Count of chats for folders '%s': %s", folder_ids, count)
