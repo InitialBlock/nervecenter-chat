@@ -22,11 +22,13 @@ from open_webui.models.chats import (
     Chats,
     ChatsImportForm,
     ChatStatsExport,
+    ChatThreadTreeResponse,
     ChatTitleIdResponse,
     ChatUsageStatsListResponse,
     MessageStats,
     chat_search_content_query,
     chat_search_terms,
+    thread_title_from_message,
 )
 from open_webui.models.config import Config
 from open_webui.models.folders import Folders
@@ -1486,6 +1488,27 @@ async def delete_chat_message_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
+    # Branch-point guard: message deletion is never single — the message's
+    # direct children are removed with it. Block the whole operation if ANY id
+    # in that deletion set anchors an existing child thread (indexed lookup on
+    # (parent_chat_id, branch_from_message_id)).
+    deletion_ids = Chats.get_message_deletion_ids((chat.chat or {}).get('history') or {}, message_id)
+    branch_point_ids = await Chats.get_thread_branch_point_message_ids(
+        id,
+        chat.user_id,
+        deletion_ids or {message_id},
+        db=db,
+    )
+    if branch_point_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'message': 'This message (or a reply that would be deleted with it) '
+                'is the starting point of an existing thread.',
+                'branch_point_message_ids': sorted(branch_point_ids),
+            },
+        )
+
     chat = await Chats.delete_message_from_chat_by_id_and_message_id(id, message_id)
     if not chat:
         raise HTTPException(
@@ -1564,10 +1587,48 @@ async def send_chat_message_event_by_id(
 ############################
 
 
+async def _delete_chat_thread_subtree(request: Request, chat, subtree_ids: list[str], db: AsyncSession) -> bool:
+    """Cascade-delete a chat and its whole thread subtree (KTD6).
+
+    Stops in-flight tasks per chat (internal companion chats included), applies
+    the orphan-tag cleanup, then removes every row in one transaction.
+    """
+    # Stop in-flight tasks and fold each subtree chat's internal companion
+    # chats (notes/subagents/timers) into the deletion set.
+    ids = list(subtree_ids)
+    for chat_id in subtree_ids:
+        await stop_item_tasks(request.app.state.redis, chat_id)
+        for internal_child_id in await Chats.get_internal_chat_ids_by_parent_id(chat_id, chat.user_id):
+            await stop_item_tasks(request.app.state.redis, internal_child_id)
+            ids.append(internal_child_id)
+
+    # Orphan-tag cleanup. Tag counts only see visible chats (non-archived,
+    # non-thread, non-internal), so the addressed chat is the only member of
+    # the deletion set the count query can still observe: its tags use
+    # threshold=1 exactly like the single-chat path; every other deleted
+    # chat's tags are plain orphan checks (threshold=0).
+    root_tag_ids = set(chat.meta.get('tags', []))
+    descendant_tag_ids = {
+        tag_id
+        for meta in await Chats.get_chat_metas_by_chat_ids(ids[1:], include_archived=True, db=db)
+        for tag_id in (meta.get('tags') or [])
+    }
+    if chat.parent_chat_id is None and not chat.archived:
+        await Chats.delete_orphan_tags_for_user(list(root_tag_ids), chat.user_id, threshold=1, db=db)
+        descendant_tag_ids -= root_tag_ids
+    else:
+        descendant_tag_ids |= root_tag_ids
+    await Chats.delete_orphan_tags_for_user(list(descendant_tag_ids), chat.user_id, threshold=0, db=db)
+
+    # All rows in one transaction (single session): the subtree goes atomically.
+    return await Chats.delete_chats_by_ids_and_user_id(ids, chat.user_id, db=db)
+
+
 @router.delete('/{id}', response_model=bool)
 async def delete_chat_by_id(
     request: Request,
     id: str,
+    cascade: bool = False,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -1589,20 +1650,38 @@ async def delete_chat_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    # Cancel any in-flight LLM tasks (streaming, title/tags generation) before
-    # deleting the chat to prevent orphaned requests.
-    await stop_item_tasks(request.app.state.redis, id)
-    await Chats.delete_orphan_tags_for_user(chat.meta.get('tags', []), user.id, threshold=1, db=db)
+    # Thread deletion protection (KTD6): a chat with thread descendants is only
+    # deleted under an explicit cascade; otherwise 409 with the full subtree
+    # descendant count so the client can ask for confirmation.
+    subtree_ids = await Chats.get_thread_subtree_ids(id, chat.user_id, db=db) or [id]
+    descendant_count = len(subtree_ids) - 1
+    if descendant_count and not cascade:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                'message': 'Chat has thread descendants; retry with cascade=true to delete the whole subtree.',
+                'descendant_count': descendant_count,
+            },
+        )
 
-    # Cascade to internal child chats spawned from this one.
-    for child_id in await Chats.get_internal_chat_ids_by_parent_id(id, chat.user_id):
-        await stop_item_tasks(request.app.state.redis, child_id)
-        await Chats.delete_chat_by_id_and_user_id(child_id, chat.user_id)
-
-    if user.role == 'admin':
-        result = await Chats.delete_chat_by_id(id, db=db)
+    if descendant_count:
+        result = await _delete_chat_thread_subtree(request, chat, subtree_ids, db)
     else:
-        result = await Chats.delete_chat_by_id_and_user_id(id, user.id, db=db)
+        # No thread descendants — existing single-chat behavior, unchanged.
+        # Cancel any in-flight LLM tasks (streaming, title/tags generation)
+        # before deleting the chat to prevent orphaned requests.
+        await stop_item_tasks(request.app.state.redis, id)
+        await Chats.delete_orphan_tags_for_user(chat.meta.get('tags', []), user.id, threshold=1, db=db)
+
+        # Cascade to internal child chats spawned from this one.
+        for child_id in await Chats.get_internal_chat_ids_by_parent_id(id, chat.user_id):
+            await stop_item_tasks(request.app.state.redis, child_id)
+            await Chats.delete_chat_by_id_and_user_id(child_id, chat.user_id)
+
+        if user.role == 'admin':
+            result = await Chats.delete_chat_by_id(id, db=db)
+        else:
+            result = await Chats.delete_chat_by_id_and_user_id(id, user.id, db=db)
 
     if result:
         await publish_event(
@@ -1610,9 +1689,110 @@ async def delete_chat_by_id(
             EVENTS.CHAT_DELETED,
             actor=user,
             subject_id=id,
-            data={'owner_id': chat.user_id},
+            data={'owner_id': chat.user_id, 'descendant_count': descendant_count},
         )
     return result
+
+
+############################
+# Chat Threads
+############################
+
+
+class ThreadForm(BaseModel):
+    message_id: str
+    title: str | None = None
+
+
+@router.post('/{id}/threads', response_model=ChatResponse | None)
+async def create_chat_thread(
+    request: Request,
+    id: str,
+    form_data: ThreadForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Create a side thread branching off a message of chat *id*.
+
+    The only writer of the server-controlled thread columns
+    (``parent_chat_id``, ``branch_from_message_id``, ``root_chat_id``).
+    """
+    chat = await Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
+    if not chat:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    history = (chat.chat or {}).get('history') or {}
+    message = (history.get('messages') or {}).get(form_data.message_id)
+    if not isinstance(message, dict):
+        # Chats migrated to the chat_message table may keep a thin JSON blob.
+        message = await Chats.get_message_by_id_and_message_id(id, form_data.message_id)
+    if not isinstance(message, dict):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='message not found')
+
+    title = (form_data.title or '').strip() or thread_title_from_message(message)
+    parent_models = (chat.chat or {}).get('models')
+    thread_chat = {
+        'title': title,
+        # Same shape the parent stores — a thread starts on the parent's models.
+        'models': parent_models if isinstance(parent_models, list) else [],
+        'history': {'messages': {}, 'currentId': None},
+        'messages': [],
+    }
+
+    thread = await Chats.insert_new_chat(
+        str(uuid4()),
+        user.id,
+        # folder_id copied from the parent so folder Project prompts/knowledge
+        # keep applying; the listing filter keeps threads out of folder lists.
+        ChatForm(chat=thread_chat, folder_id=chat.folder_id),
+        db=db,
+        parent_chat_id=id,
+        branch_from_message_id=form_data.message_id,
+        root_chat_id=chat.root_chat_id or chat.id,
+    )
+    if not thread:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(),
+        )
+
+    await publish_event(
+        request,
+        EVENTS.CHAT_CREATED,
+        actor=user,
+        subject_id=thread.id,
+        data={
+            'title': thread.title,
+            'folder_id': thread.folder_id,
+            'parent_chat_id': id,
+            'branch_from_message_id': form_data.message_id,
+        },
+    )
+    return ChatResponse.model_validate(thread, from_attributes=True)
+
+
+@router.get('/{id}/threads/tree', response_model=ChatThreadTreeResponse)
+async def get_chat_thread_tree(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Whole workspace thread tree of chat *id* as flat lightweight nodes.
+
+    Resolves the workspace root (``root_chat_id`` or the chat itself) and
+    returns the root plus all chats with that root, owner-scoped, in one
+    indexed query; the client builds the nesting from ``parent_chat_id``.
+    """
+    chat = await Chats.get_chat_by_id_for_user(id, user, db=db)
+    if not chat:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    root_chat_id = chat.root_chat_id or chat.id
+    nodes = await Chats.get_thread_tree_nodes(root_chat_id, chat.user_id, db=db)
+    return ChatThreadTreeResponse(root_chat_id=root_chat_id, nodes=nodes)
 
 
 ############################
