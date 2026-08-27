@@ -152,6 +152,11 @@ class Chat(Base):  # database table mapping for chat entity
     last_read_at = Column(BigInteger, nullable=True)
     timer_at = Column(BigInteger, nullable=True)  # ns due time, set only while a timer chat waits to be claimed
 
+    # Thread hierarchy — server-controlled, never set from client form data
+    parent_chat_id = Column(Text, nullable=True)  # direct parent chat this thread branched from
+    branch_from_message_id = Column(Text, nullable=True)  # message in the parent the branch starts at
+    root_chat_id = Column(Text, nullable=True)  # top-level ancestor chat of the whole thread tree
+
     __table_args__ = (
         # Performance indexes for common queries
         Index('folder_id_idx', 'folder_id'),
@@ -176,6 +181,10 @@ class Chat(Base):  # database table mapping for chat entity
         ),
         # covering index: lets SQLite serve count_unread_by_folder_ids without reading chat rows
         Index('user_id_folder_unread_idx', 'user_id', 'folder_id', 'archived', 'updated_at', 'last_read_at', 'id'),
+        # Thread hierarchy lookups
+        Index('parent_chat_id_idx', 'parent_chat_id'),
+        Index('root_chat_id_idx', 'root_chat_id'),
+        Index('parent_chat_branch_message_idx', 'parent_chat_id', 'branch_from_message_id'),
     )
 
 
@@ -207,6 +216,11 @@ class ChatModel(BaseModel):
 
     last_read_at: int | None = None
     timer_at: int | None = None
+
+    # Thread hierarchy — server-controlled, never populated from client form data
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    root_chat_id: str | None = None
 
     @field_validator('variables', mode='before')
     @classmethod
@@ -523,6 +537,11 @@ class ChatTable:
         *,
         internal_meta: dict | None = None,
         timer_at: int | None = None,
+        # Thread hierarchy — server-controlled: settable only via these explicit
+        # parameters (a thread-creation endpoint), never from client form data.
+        parent_chat_id: str | None = None,
+        branch_from_message_id: str | None = None,
+        root_chat_id: str | None = None,
     ) -> ChatModel | None:
         async with get_async_db_context(db) as session:
             chat = ChatModel(
@@ -538,6 +557,9 @@ class ChatTable:
                     'timer_at': timer_at,
                     'variables': form_data.variables or {},
                     'current_message_id': self.get_current_message_id(form_data.chat),
+                    'parent_chat_id': parent_chat_id,
+                    'branch_from_message_id': branch_from_message_id,
+                    'root_chat_id': root_chat_id,
                     'created_at': int(time.time()),
                     'updated_at': int(time.time()),
                     'last_read_at': int(time.time()),
