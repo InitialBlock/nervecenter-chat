@@ -42,7 +42,7 @@ from open_webui.utils.auth import bearer_security, get_admin_user, get_current_u
 from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.misc import get_message_list
-from open_webui.utils.thread_context import assemble_thread_transcript
+from open_webui.utils.thread_context import assemble_thread_transcript, materialize_transcript_payload
 from open_webui.utils.models import get_all_models
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1786,10 +1786,21 @@ async def get_chat_thread_tree(
     Resolves the workspace root (``root_chat_id`` or the chat itself) and
     returns the root plus all chats with that root, owner-scoped, in one
     indexed query; the client builds the nesting from ``parent_chat_id``.
+
+    Owner-only (plus admins, same condition as the DELETE handler): the tree
+    exposes every thread title in the owner's workspace, so shared-chat and
+    folder grantees of *id* are not enough — same bar as the sibling thread
+    endpoints.
     """
-    chat = await Chats.get_chat_by_id_for_user(id, user, db=db)
+    if user.role == 'admin':
+        chat = await Chats.get_chat_by_id(id, db=db)
+    else:
+        chat = await Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
     if not chat:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
 
     root_chat_id = chat.root_chat_id or chat.id
     nodes = await Chats.get_thread_tree_nodes(root_chat_id, chat.user_id, db=db)
@@ -1849,24 +1860,12 @@ async def _materialize_thread_clone_chat(chat, updated_chat: dict) -> dict:
     flattened inherited + own transcript so the clone is self-contained (R16).
     The source chat row is never modified.
     """
-    if not getattr(chat, 'parent_chat_id', None):
+    materialized = await materialize_transcript_payload(chat, updated_chat)
+    if materialized is None:
         return updated_chat
 
-    transcript_history, transcript_messages = await assemble_thread_transcript(
-        chat,
-        chat.current_message_id or (chat.chat.get('history') or {}).get('currentId'),
-        chat.user_id,
-    )
-    if not transcript_history.get('messages'):
-        return updated_chat
-
-    updated_chat = {**updated_chat, 'history': transcript_history}
-    if 'messages' in updated_chat:
-        updated_chat['messages'] = transcript_messages
-    updated_chat['branchPointMessageId'] = transcript_history.get('currentId')
-    # A stale top-level currentId would contradict the rebuilt history.
-    updated_chat.pop('currentId', None)
-    return updated_chat
+    materialized['branchPointMessageId'] = (materialized.get('history') or {}).get('currentId')
+    return materialized
 
 
 class CloneForm(BaseModel):

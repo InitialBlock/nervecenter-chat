@@ -211,7 +211,10 @@ async def assemble_thread_context_with_prefix(
         different user are treated as unresolvable.
     :param max_depth: injectable corruption-guard cap on ancestor count.
     :param get_chat: ``async (chat_id) -> chat | None`` override (tests);
-        defaults to ``Chats.get_chat_by_id``.
+        defaults to ``Chats.get_chat_thread_pointer_by_id`` — ancestors only
+        contribute ownership and thread pointers, so the walk never loads an
+        ancestor's full chat JSON. Only the first row (*chat* itself, passed
+        in by the caller) is a full chat row.
     :param get_messages_map: ``async (chat_id) -> dict | None`` override
         (tests); defaults to ``Chats.get_messages_map_by_chat_id``.
     :return: ``(context, inherited_count)`` where ``context[:inherited_count]``
@@ -224,7 +227,7 @@ async def assemble_thread_context_with_prefix(
         # would drag the full app config along with it.
         from open_webui.models.chats import Chats
 
-        get_chat = get_chat or Chats.get_chat_by_id
+        get_chat = get_chat or Chats.get_chat_thread_pointer_by_id
         get_messages_map = get_messages_map or Chats.get_messages_map_by_chat_id
 
     # Walk leaf-most -> root-most, collecting (messages_map, branch_message_id)
@@ -321,7 +324,10 @@ async def assemble_thread_transcript(
         # Imported lazily: see assemble_thread_context_with_prefix.
         from open_webui.models.chats import Chats
 
-        get_chat = get_chat or Chats.get_chat_by_id
+        # Ancestors only need thread pointers; raw-message recording below
+        # wraps get_messages_map, not get_chat, so the lightweight fetcher is
+        # safe here too.
+        get_chat = get_chat or Chats.get_chat_thread_pointer_by_id
         get_messages_map = get_messages_map or Chats.get_messages_map_by_chat_id
 
     raw_messages_by_id: dict = {}
@@ -347,3 +353,39 @@ async def assemble_thread_transcript(
     from open_webui.utils.chat_fork import build_transcript_history
 
     return build_transcript_history(context, raw_messages_by_id=raw_messages_by_id)
+
+
+async def materialize_transcript_payload(chat: Any, base_payload: dict) -> dict | None:
+    """Copy of *base_payload* with a thread's materialized transcript spliced in.
+
+    Resolves the thread's target message (``current_message_id``, falling back
+    to the stored history's ``currentId``), materializes the full inherited +
+    own transcript via :func:`assemble_thread_transcript`, and returns a copy
+    of *base_payload* whose ``history`` (and legacy ``messages`` list, when
+    present) is the transcript, with any stale top-level ``currentId`` dropped.
+
+    Returns ``None`` when *chat* is not a thread (no ``parent_chat_id``) or
+    the materialized transcript is empty — callers keep their own payload
+    unchanged. Shared by share snapshots (``models/shared_chats.py``) and
+    thread clones/forks (``routers/chats.py``); each call site keeps its own
+    error-handling policy, so unexpected exceptions propagate.
+    """
+    if not getattr(chat, 'parent_chat_id', None):
+        return None
+
+    chat_payload = chat.chat if isinstance(getattr(chat, 'chat', None), dict) else {}
+    target_message_id = getattr(chat, 'current_message_id', None) or (
+        (chat_payload.get('history') or {}).get('currentId')
+    )
+    transcript_history, transcript_messages = await assemble_thread_transcript(
+        chat, target_message_id, getattr(chat, 'user_id', None)
+    )
+    if not transcript_history.get('messages'):
+        return None
+
+    payload = {**base_payload, 'history': transcript_history}
+    if 'messages' in payload:
+        payload['messages'] = transcript_messages
+    # A stale top-level currentId would contradict the rebuilt history.
+    payload.pop('currentId', None)
+    return payload

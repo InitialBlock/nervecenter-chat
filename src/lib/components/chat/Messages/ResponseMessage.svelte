@@ -46,6 +46,7 @@
 	import RateComment from './RateComment.svelte';
 	import WebSearchResults from './ResponseMessage/WebSearchResults.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
+	import Branch from '$lib/components/icons/Branch.svelte';
 
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
@@ -1535,21 +1536,7 @@
 													startThreadHandler?.(message.id);
 												}}
 											>
-												<svg
-													class="w-4 h-4"
-													viewBox="0 0 24 24"
-													fill="none"
-													stroke="currentColor"
-													stroke-width="1.8"
-													stroke-linecap="round"
-													stroke-linejoin="round"
-													aria-hidden="true"
-												>
-													<path d="M6 3v12" />
-													<circle cx="18" cy="6" r="3" />
-													<circle cx="6" cy="18" r="3" />
-													<path d="M18 9a9 9 0 0 1-9 9" />
-												</svg>
+												<Branch className="w-4 h-4" strokeWidth="1.8" />
 											</button>
 										</Tooltip>
 									{/if}

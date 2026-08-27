@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { buildThreadTree, type ThreadTreeNode } from './threads';
+import {
+	buildThreadTree,
+	findThreadBranch,
+	flattenThreadTree,
+	type ThreadTreeNode
+} from './threads';
 
 const node = (
 	id: string,
@@ -15,18 +20,6 @@ const node = (
 	updated_at: created_at,
 	...overrides
 });
-
-const collectIds = (branches: ReturnType<typeof buildThreadTree>): string[] => {
-	const ids: string[] = [];
-	const walk = (items: ReturnType<typeof buildThreadTree>) => {
-		for (const item of items) {
-			ids.push(item.id);
-			walk(item.children);
-		}
-	};
-	walk(branches);
-	return ids;
-};
 
 describe('buildThreadTree', () => {
 	it('nests flat nodes and orders children by created_at ascending', () => {
@@ -62,7 +55,7 @@ describe('buildThreadTree', () => {
 			node('self', 'self', 40)
 		]);
 
-		const ids = collectIds(tree);
+		const ids = flattenThreadTree(tree).map((branch) => branch.id);
 		expect([...ids].sort()).toEqual(['a', 'b', 'child', 'self']);
 		// every node appears exactly once
 		expect(new Set(ids).size).toBe(ids.length);
@@ -81,5 +74,31 @@ describe('buildThreadTree', () => {
 
 	it('returns an empty array for empty or missing input', () => {
 		expect(buildThreadTree([])).toEqual([]);
+	});
+});
+
+describe('findThreadBranch', () => {
+	it('finds a branch at any depth and returns it with its subtree intact', () => {
+		const tree = buildThreadTree([
+			node('a', null, 10),
+			node('b', 'a', 20),
+			node('c', 'b', 30),
+			node('d', 'b', 40)
+		]);
+
+		const branch = findThreadBranch(tree, 'b');
+		expect(branch?.id).toBe('b');
+		expect(flattenThreadTree(branch ? [branch] : []).map((item) => item.id)).toEqual([
+			'b',
+			'c',
+			'd'
+		]);
+	});
+
+	it('returns null when the id is not in the tree', () => {
+		const tree = buildThreadTree([node('a', null, 10)]);
+
+		expect(findThreadBranch(tree, 'missing')).toBeNull();
+		expect(findThreadBranch([], 'a')).toBeNull();
 	});
 });

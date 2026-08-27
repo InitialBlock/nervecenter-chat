@@ -2177,8 +2177,14 @@ async def convert_url_images_to_base64(form_data, user=None):
 
 MESSAGE_REPLAY_KEYS = ('id', 'role', 'content', 'output', 'files', 'contextSummary', 'usage', 'model')
 
+# Sentinel distinguishing "chat row not supplied" (load_messages_from_db fetches
+# it) from an explicit None (the caller already looked it up and found no row).
+_CHAT_NOT_SUPPLIED = object()
 
-async def load_messages_from_db(chat_id: str, message_id: str, metadata: dict | None = None) -> Optional[list[dict]]:
+
+async def load_messages_from_db(
+    chat_id: str, message_id: str, metadata: dict | None = None, chat=_CHAT_NOT_SUPPLIED
+) -> Optional[list[dict]]:
     """
     Load the message chain from DB up to message_id,
     keeping only fields needed to rebuild the LLM payload.
@@ -2194,8 +2200,13 @@ async def load_messages_from_db(chat_id: str, message_id: str, metadata: dict | 
     ``metadata['thread_inherited_message_count']`` so context compaction can
     keep the inherited prefix uncompacted and scope its boundary (and
     checkpoint upserts) to the thread's own messages.
+
+    ``chat`` optionally supplies the already-fetched chat row for *chat_id*
+    (or None when the caller found no row) so callers that need the row
+    themselves avoid a second query; when not supplied it is fetched here.
     """
-    chat = await Chats.get_chat_by_id(chat_id)
+    if chat is _CHAT_NOT_SUPPLIED:
+        chat = await Chats.get_chat_by_id(chat_id)
     if chat is not None and getattr(chat, 'parent_chat_id', None):
         db_messages, inherited_count = await assemble_thread_context_with_prefix(chat, message_id, chat.user_id)
         if metadata is not None:
@@ -2451,8 +2462,12 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     chat_id = metadata.get('chat_id')
     user_message_id = metadata.get('user_message_id')
 
+    # Fetched once for the whole saved-chat pipeline: load_messages_from_db
+    # below and the note-chat detection further down both need this row.
+    chat = await Chats.get_chat_by_id(chat_id) if is_saved_chat_id(chat_id) else None
+
     if is_saved_chat_id(chat_id) and user_message_id:
-        db_messages = await load_messages_from_db(chat_id, user_message_id, metadata)
+        db_messages = await load_messages_from_db(chat_id, user_message_id, metadata, chat=chat)
         if db_messages:
             # Continue: frontend sends assistant_message_id when continuing
             # an existing response. Load its content so the LLM sees prior output.
@@ -2772,8 +2787,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     )
     available_skills = []
     view_skill_ids = []
-    chat = None
-    if is_saved_chat_id(metadata.get('chat_id')):
+    # Reuse the chat row fetched near the top of this function; refetch only
+    # if no row was found then or an inlet filter swapped metadata['chat_id'].
+    if chat is not None and getattr(chat, 'id', None) != metadata.get('chat_id'):
+        chat = None
+    if chat is None and is_saved_chat_id(metadata.get('chat_id')):
         chat = await Chats.get_chat_by_id(metadata['chat_id'])
 
     is_note_chat = bool(chat and (chat.meta or {}).get('internal') is True and (chat.meta or {}).get('type') == 'note')

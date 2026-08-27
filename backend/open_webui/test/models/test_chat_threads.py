@@ -5,6 +5,7 @@ adjacency mapping, the message-deletion set is computed on plain history
 dicts, and the default thread title is a pure snippet derivation.
 """
 
+import asyncio
 import copy
 import os
 import tempfile
@@ -19,6 +20,7 @@ from open_webui.models.chats import (  # noqa: E402
     THREAD_TITLE_MAX_LENGTH,
     ChatTable,
     collect_thread_subtree_ids,
+    expand_ids_with_live_children,
     thread_title_from_message,
 )
 
@@ -195,3 +197,72 @@ def test_title_fallback_on_missing_or_non_string_content():
     assert thread_title_from_message(None) == DEFAULT_THREAD_TITLE
     assert thread_title_from_message({}) == DEFAULT_THREAD_TITLE
     assert thread_title_from_message({'content': ['not', 'a', 'string']}) == DEFAULT_THREAD_TITLE
+
+
+# ---------------------------------------------------------------------------
+# expand_ids_with_live_children — fixed-point expansion closing the cascade
+# delete's TOCTOU window (children created after the subtree snapshot)
+# ---------------------------------------------------------------------------
+
+
+def make_adjacency_fetcher(children_by_parent, call_log=None):
+    """Fetcher backed by a static parent -> children mapping (fake DB query)."""
+
+    async def fetch_new_child_ids(current_ids):
+        if call_log is not None:
+            call_log.append(set(current_ids))
+        return [
+            child_id
+            for parent_id in current_ids
+            for child_id in children_by_parent.get(parent_id, [])
+            if child_id not in current_ids
+        ]
+
+    return fetch_new_child_ids
+
+
+def test_expand_no_live_children_is_identity():
+    fetcher = make_adjacency_fetcher({})
+    assert asyncio.run(expand_ids_with_live_children({'a', 'b'}, fetcher)) == {'a', 'b'}
+
+
+def test_expand_picks_up_child_created_after_snapshot():
+    # Snapshot was {a}; a thread 'late' was created under 'a' mid-window.
+    fetcher = make_adjacency_fetcher({'a': ['late']})
+    assert asyncio.run(expand_ids_with_live_children({'a'}, fetcher)) == {'a', 'late'}
+
+
+def test_expand_reaches_grandchildren_across_iterations():
+    # Each generation only becomes visible once its parent joins the set.
+    fetcher = make_adjacency_fetcher({'a': ['b'], 'b': ['c'], 'c': ['d']})
+    assert asyncio.run(expand_ids_with_live_children({'a'}, fetcher)) == {'a', 'b', 'c', 'd'}
+
+
+def test_expand_stops_at_fixed_point():
+    call_log = []
+    fetcher = make_adjacency_fetcher({'a': ['b']}, call_log)
+    asyncio.run(expand_ids_with_live_children({'a'}, fetcher))
+    # One round finds 'b', the next confirms the fixed point — then it stops.
+    assert len(call_log) == 2
+
+
+def test_expand_cycle_terminates():
+    # Corrupted pointers forming a cycle: members are excluded per round, so
+    # the set converges instead of looping.
+    fetcher = make_adjacency_fetcher({'a': ['b'], 'b': ['a']})
+    assert asyncio.run(expand_ids_with_live_children({'a'}, fetcher)) == {'a', 'b'}
+
+
+def test_expand_bounded_by_max_iterations():
+    chain = {f'n{i}': [f'n{i + 1}'] for i in range(100)}
+    fetcher = make_adjacency_fetcher(chain)
+    expanded = asyncio.run(expand_ids_with_live_children({'n0'}, fetcher, max_iterations=3))
+    # One generation per iteration: n0 plus three discovered descendants.
+    assert expanded == {'n0', 'n1', 'n2', 'n3'}
+
+
+def test_expand_does_not_mutate_input():
+    ids = {'a'}
+    fetcher = make_adjacency_fetcher({'a': ['b']})
+    asyncio.run(expand_ids_with_live_children(ids, fetcher))
+    assert ids == {'a'}

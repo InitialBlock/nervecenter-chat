@@ -297,6 +297,19 @@
 
 		if (res) {
 			await chatDeletedHandler(id);
+
+			// The cascade may have deleted the currently viewed chat as a
+			// descendant of the deleted thread — probe it and navigate home
+			// if it's gone.
+			if ($chatId && $chatId !== id) {
+				const viewedChat = await getChatById(localStorage.token, $chatId).catch(() => null);
+				if (!viewedChat) {
+					await goto('/');
+
+					await chatId.set('');
+					await tick();
+				}
+			}
 		}
 
 		deleting = false;

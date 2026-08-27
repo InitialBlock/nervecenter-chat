@@ -66,7 +66,7 @@
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
-	import { buildThreadTree } from '$lib/utils/threads';
+	import { buildThreadTree, findThreadBranch, flattenThreadTree } from '$lib/utils/threads';
 	import { applyResponseStreamEvent, getOutputText } from './Messages/structuredOutput';
 
 	import {
@@ -114,7 +114,7 @@
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Navbar from '$lib/components/chat/Navbar.svelte';
 	import ChatControls from './ChatControls.svelte';
-	import ThreadNavigator from './ThreadNavigator.svelte';
+	import ThreadNavigatorPanel from './ThreadNavigatorPanel.svelte';
 	import Drawer from '../common/Drawer.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 	import DeleteConfirmDialog from '../common/ConfirmDialog.svelte';
@@ -490,26 +490,12 @@
 	let threadCascadeDeleteTarget = null; // { id: string, count: number }
 
 	// Full subtree of `rootId` (inclusive) computed from the PRE-delete tree.
+	// Rebuilds the tree from `threadTreeNodes` (instead of reusing the reactive
+	// `threadTreeRoot`) so the snapshot is guaranteed to match the node list the
+	// caller reads in the same tick, independent of Svelte's flush timing.
 	const getThreadSubtreeIds = (rootId) => {
-		const childrenByParent = {};
-		for (const node of threadTreeNodes) {
-			if (node.parent_chat_id) {
-				(childrenByParent[node.parent_chat_id] ??= []).push(node.id);
-			}
-		}
-
-		const ids = new Set([rootId]);
-		const queue = [rootId];
-		while (queue.length > 0) {
-			const current = queue.shift();
-			for (const childId of childrenByParent[current] ?? []) {
-				if (!ids.has(childId)) {
-					ids.add(childId);
-					queue.push(childId);
-				}
-			}
-		}
-		return ids;
+		const branch = findThreadBranch(buildThreadTree(threadTreeNodes), rootId);
+		return new Set(branch ? flattenThreadTree([branch]).map((node) => node.id) : [rootId]);
 	};
 
 	// POST-DELETE NAVIGATION RULE: when the delete removed the currently viewed
@@ -5006,39 +4992,18 @@
 						<div
 							class="h-full w-72 max-w-full shrink-0 z-10 flex flex-col bg-white dark:bg-gray-900 border-s border-gray-50 dark:border-gray-850"
 						>
-							<div class="flex items-center justify-between px-3 pt-2 pb-2 shrink-0">
-								<div class="flex min-w-0 items-center gap-2">
-									<div class="truncate text-sm font-medium text-gray-700 dark:text-gray-200">
-										{$i18n.t('Thread tree')}
-									</div>
-									{#if threadTreeLoading}
-										<Spinner className="size-3" />
-									{/if}
-								</div>
-								<button
-									class="p-1 rounded-lg text-gray-500 dark:text-gray-400"
-									on:click={() => {
-										showThreadNavigator = false;
-									}}
-									aria-label={$i18n.t('Close')}
-								>
-									<XMark className="size-4" strokeWidth="2" />
-								</button>
-							</div>
-							{#if threadTreeError}
-								<div class="px-3 pb-1 text-xs text-red-500 dark:text-red-400 shrink-0">
-									{$i18n.t('Failed to load thread tree')}
-								</div>
-							{/if}
-							<div class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
-								<ThreadNavigator
-									threadTree={threadTreeRoot}
-									activeChatId={$chatId}
-									onSelect={selectThreadHandler}
-									onRenameThread={renameThreadHandler}
-									onDeleteThread={deleteThreadHandler}
-								/>
-							</div>
+							<ThreadNavigatorPanel
+								threadTree={threadTreeRoot}
+								activeChatId={$chatId}
+								loading={threadTreeLoading}
+								error={threadTreeError}
+								onClose={() => {
+									showThreadNavigator = false;
+								}}
+								onSelect={selectThreadHandler}
+								onRenameThread={renameThreadHandler}
+								onDeleteThread={deleteThreadHandler}
+							/>
 						</div>
 					{:else}
 						<Drawer
@@ -5049,39 +5014,18 @@
 							className="min-h-[100dvh] !bg-white dark:!bg-gray-850"
 						>
 							<div class="h-[100dvh] flex flex-col">
-								<div class="flex items-center justify-between px-3 pt-2 pb-2 shrink-0">
-									<div class="flex min-w-0 items-center gap-2">
-										<div class="truncate text-sm font-medium text-gray-700 dark:text-gray-200">
-											{$i18n.t('Thread tree')}
-										</div>
-										{#if threadTreeLoading}
-											<Spinner className="size-3" />
-										{/if}
-									</div>
-									<button
-										class="p-1 rounded-lg text-gray-500 dark:text-gray-400"
-										on:click={() => {
-											showThreadNavigator = false;
-										}}
-										aria-label={$i18n.t('Close')}
-									>
-										<XMark className="size-4" strokeWidth="2" />
-									</button>
-								</div>
-								{#if threadTreeError}
-									<div class="px-3 pb-1 text-xs text-red-500 dark:text-red-400 shrink-0">
-										{$i18n.t('Failed to load thread tree')}
-									</div>
-								{/if}
-								<div class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
-									<ThreadNavigator
-										threadTree={threadTreeRoot}
-										activeChatId={$chatId}
-										onSelect={selectThreadHandler}
-										onRenameThread={renameThreadHandler}
-										onDeleteThread={deleteThreadHandler}
-									/>
-								</div>
+								<ThreadNavigatorPanel
+									threadTree={threadTreeRoot}
+									activeChatId={$chatId}
+									loading={threadTreeLoading}
+									error={threadTreeError}
+									onClose={() => {
+										showThreadNavigator = false;
+									}}
+									onSelect={selectThreadHandler}
+									onRenameThread={renameThreadHandler}
+									onDeleteThread={deleteThreadHandler}
+								/>
 							</div>
 						</Drawer>
 					{/if}

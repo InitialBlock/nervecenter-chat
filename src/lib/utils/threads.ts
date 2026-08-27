@@ -99,6 +99,23 @@ export const buildThreadTree = (nodes: ThreadTreeNode[]): ThreadTreeBranch[] => 
 	return roots;
 };
 
+/** Find the branch with the given id anywhere in a nested thread tree. */
+export const findThreadBranch = (
+	branches: ThreadTreeBranch[],
+	id: string
+): ThreadTreeBranch | null => {
+	for (const branch of branches ?? []) {
+		if (branch.id === id) {
+			return branch;
+		}
+		const found = findThreadBranch(branch.children, id);
+		if (found) {
+			return found;
+		}
+	}
+	return null;
+};
+
 /** Flatten a nested thread tree back into a depth-first ordered list. */
 export const flattenThreadTree = (branches: ThreadTreeBranch[]): ThreadTreeBranch[] => {
 	const out: ThreadTreeBranch[] = [];

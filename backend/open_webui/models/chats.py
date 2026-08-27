@@ -261,6 +261,44 @@ def collect_thread_subtree_ids(chat_id: str, children_by_parent: dict[str, list[
     return subtree_ids
 
 
+async def expand_ids_with_live_children(ids: set[str], fetch_new_child_ids, max_iterations: int = 50) -> set[str]:
+    """Expand *ids* with every live thread child until a fixed point.
+
+    Closes the TOCTOU window between a caller's subtree snapshot and the
+    actual delete: a thread created concurrently under any chat in the set
+    (grandchildren included) is picked up here, inside the delete
+    transaction, instead of becoming an invisible orphan.
+
+    Pure over an injected fetcher so it is testable without a DB:
+    ``fetch_new_child_ids`` is ``async (current_ids: set[str]) -> iterable of
+    child ids`` whose parent is in *current_ids* but which are not themselves
+    members. The set only ever grows and members are excluded from each round,
+    so a corrupted parent-pointer cycle cannot loop; ``max_iterations`` bounds
+    the walk regardless (one iteration per generation of new descendants).
+    """
+    expanded = set(ids)
+    for _ in range(max_iterations):
+        new_child_ids = {child_id for child_id in await fetch_new_child_ids(expanded) if child_id not in expanded}
+        if not new_child_ids:
+            break
+        expanded |= new_child_ids
+    return expanded
+
+
+def _ids_removed_by_delete(message_id: str, message: dict, messages: dict) -> set[str]:
+    """Ids removed when *message_id* is deleted from a history messages map.
+
+    Message deletion is never single: the message's direct children (those
+    present in *messages*) go with it; grandchildren are re-parented, not
+    removed. Single source of truth for ``get_message_deletion_ids`` and
+    ``delete_message_from_history``.
+    """
+    return {
+        message_id,
+        *(child_id for child_id in (message.get('childrenIds') or []) if child_id in messages),
+    }
+
+
 class ChatModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)  # allows ORM model binding
     id: str
@@ -378,6 +416,11 @@ class ChatResponse(BaseModel):
     current_message_id: str | None = None
     context_usage: dict | None = None
 
+    # Thread hierarchy — server-controlled, never populated from client form data
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    root_chat_id: str | None = None
+
     @field_validator('variables', mode='before')
     @classmethod
     def normalize_variables(cls, value):
@@ -408,6 +451,20 @@ class ChatThreadNode(BaseModel):
 class ChatThreadTreeResponse(BaseModel):
     root_chat_id: str
     nodes: list[ChatThreadNode]
+
+
+class ChatThreadPointer(BaseModel):
+    """Thread-pointer projection of a chat row — no JSON blob.
+
+    Exactly what the thread-context ancestor walk reads from each ancestor
+    (via ``getattr``): identity, ownership, and the three thread columns.
+    """
+
+    id: str
+    user_id: str
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    root_chat_id: str | None = None
 
 
 class SharedChatResponse(BaseModel):
@@ -743,6 +800,32 @@ class ChatTable:
                 .order_by(Chat.created_at.asc(), Chat.id.asc())
             )
             return [ChatThreadNode(**dict(row._mapping)) for row in result.all()]
+
+    async def get_chat_thread_pointer_by_id(self, id: str, db: AsyncSession | None = None) -> ChatThreadPointer | None:
+        """Thread-pointer columns of a chat, without loading the JSON blob.
+
+        Default ancestor fetcher of the thread-context walk
+        (``open_webui/utils/thread_context.py``): each ancestor only
+        contributes its ownership and thread pointers, so selecting the five
+        small columns avoids deserializing every ancestor's full chat JSON.
+        """
+        try:
+            async with get_async_db_context(db) as session:
+                result = await session.execute(
+                    select(
+                        Chat.id,
+                        Chat.user_id,
+                        Chat.parent_chat_id,
+                        Chat.branch_from_message_id,
+                        Chat.root_chat_id,
+                    ).where(Chat.id == id)
+                )
+                row = result.first()
+                if row is None:
+                    return None
+                return ChatThreadPointer(**dict(row._mapping))
+        except Exception:
+            return None
 
     async def get_thread_branch_point_message_ids(
         self,
@@ -1113,10 +1196,7 @@ class ChatTable:
         if not isinstance(message, dict):
             return set()
 
-        return {
-            message_id,
-            *(child_id for child_id in (message.get('childrenIds') or []) if child_id in messages),
-        }
+        return _ids_removed_by_delete(message_id, message, messages)
 
     @staticmethod
     def delete_message_from_history(history: dict, message_id: str) -> set[str]:
@@ -1126,7 +1206,9 @@ class ChatTable:
             return set()
 
         parent_id = message.get('parentId')
-        child_ids = [child_id for child_id in (message.get('childrenIds') or []) if child_id in messages]
+        deleted_ids = _ids_removed_by_delete(message_id, message, messages)
+        # Ordered view of the removed children (order matters for re-linking).
+        child_ids = [child_id for child_id in (message.get('childrenIds') or []) if child_id in deleted_ids]
         grandchild_ids = [
             grandchild_id
             for child_id in child_ids
@@ -1142,7 +1224,6 @@ class ChatTable:
         for grandchild_id in grandchild_ids:
             messages[grandchild_id]['parentId'] = parent_id
 
-        deleted_ids = {message_id, *child_ids}
         for deleted_id in deleted_ids:
             messages.pop(deleted_id, None)
 
@@ -2690,19 +2771,39 @@ class ChatTable:
 
         Owner-scoped. Used by the thread-cascade delete paths so a subtree is
         removed atomically — either every chat in the set goes or none does.
+
+        The id set is re-expanded here, inside the delete transaction, with
+        any owner-scoped thread children created after the caller snapshotted
+        its subtree (:func:`expand_ids_with_live_children`), so a thread
+        racing the cascade delete cannot survive as an invisible orphan.
         """
+        from open_webui.models.shared_chats import SharedChats
+
         if not ids:
             return True
         try:
             async with get_async_db_context(db) as session:
-                await session.execute(update(AutomationRun).filter(AutomationRun.chat_id.in_(ids)).values(chat_id=None))
-                await session.execute(delete(ChatMessage).filter(ChatMessage.chat_id.in_(ids)))
-                await session.execute(delete(Chat).filter(Chat.id.in_(ids), Chat.user_id == user_id))
+
+                async def fetch_new_child_ids(current_ids: set[str]) -> list[str]:
+                    result = await session.execute(
+                        select(Chat.id).where(
+                            Chat.user_id == user_id,
+                            Chat.parent_chat_id.in_(current_ids),
+                            Chat.id.not_in(current_ids),
+                        )
+                    )
+                    return list(result.scalars().all())
+
+                chat_ids = list(await expand_ids_with_live_children(set(ids), fetch_new_child_ids))
+
+                await session.execute(
+                    update(AutomationRun).filter(AutomationRun.chat_id.in_(chat_ids)).values(chat_id=None)
+                )
+                await session.execute(delete(ChatMessage).filter(ChatMessage.chat_id.in_(chat_ids)))
+                await session.execute(delete(Chat).filter(Chat.id.in_(chat_ids), Chat.user_id == user_id))
                 await session.commit()
 
-                for chat_id in ids:
-                    await self.delete_shared_chat_by_chat_id(chat_id, db=session)
-                return True
+                return True and await SharedChats.delete_by_chat_ids(chat_ids, db=session)
         except Exception:
             return False
 
@@ -2732,19 +2833,39 @@ class ChatTable:
     ) -> bool:
         try:
             async with get_async_db_context(db) as session:
-                result = await session.execute(select(Chat.id).filter_by(user_id=user_id, folder_id=folder_id))
-                folder_chat_ids = list(result.scalars().all())
+                result = await session.execute(
+                    select(Chat.id, Chat.root_chat_id).filter_by(user_id=user_id, folder_id=folder_id)
+                )
+                folder_chats = result.all()
 
                 # Expand each contained chat to its full thread subtree so folder
                 # deletion never orphans threads. Threads copy the parent's
                 # folder_id, so most are already in the folder set; the union
-                # picks up any that were moved out of the folder.
-                chat_ids: set[str] = set(folder_chat_ids)
+                # picks up any that were moved out of the folder. Batched like
+                # get_thread_tree_nodes: the folder query above resolves the
+                # workspace roots, one indexed query fetches every workspace's
+                # parent -> children adjacency, then the pure cycle-guarded BFS
+                # (:func:`collect_thread_subtree_ids`) runs locally per chat.
+                chat_ids: set[str] = {chat_id for chat_id, _ in folder_chats}
+                root_chat_ids = {root_chat_id or chat_id for chat_id, root_chat_id in folder_chats}
+
+                children_by_parent: dict[str, list[str]] = {}
+                if root_chat_ids:
+                    result = await session.execute(
+                        select(Chat.id, Chat.parent_chat_id).where(
+                            Chat.user_id == user_id,
+                            or_(Chat.root_chat_id.in_(root_chat_ids), Chat.id.in_(root_chat_ids)),
+                        )
+                    )
+                    for descendant_id, parent_id in result.all():
+                        if parent_id:
+                            children_by_parent.setdefault(parent_id, []).append(descendant_id)
+
                 expanded: set[str] = set()
-                for chat_id in folder_chat_ids:
+                for chat_id, _ in folder_chats:
                     if chat_id in expanded:
                         continue  # already covered by a previously collected subtree
-                    subtree_chat_ids = await self.get_thread_subtree_ids(chat_id, user_id, db=session)
+                    subtree_chat_ids = collect_thread_subtree_ids(chat_id, children_by_parent)
                     chat_ids.update(subtree_chat_ids)
                     expanded.update(subtree_chat_ids)
 

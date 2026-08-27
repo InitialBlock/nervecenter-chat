@@ -452,6 +452,13 @@
 	};
 
 	const deleteMessage = async (messageId) => {
+		// Pin the chat this deletion belongs to and snapshot the pre-delete
+		// history so a mid-flight navigation can't misroute the request or
+		// overwrite the new chat's history, and a failed 409 refetch can
+		// still roll back the optimistic removal.
+		const targetChatId = chatId;
+		const historySnapshot = JSON.parse(JSON.stringify(history));
+
 		const messageToDelete = history.messages[messageId];
 		const parentMessageId = messageToDelete.parentId;
 		const childMessageIds = messageToDelete.childrenIds ?? [];
@@ -495,8 +502,9 @@
 
 		if (!$temporaryChatEnabled) {
 			try {
-				const res = await deleteChatMessageById(localStorage.token, chatId, messageId);
+				const res = await deleteChatMessageById(localStorage.token, targetChatId, messageId);
 				if (res?.chat?.history) {
+					if (chatId !== targetChatId) return;
 					history = res.chat.history;
 				}
 			} catch (error: any) {
@@ -504,11 +512,18 @@
 					// The deletion was rejected because a side thread branches from this
 					// message (or one of its children); restore the optimistically
 					// removed messages by refetching the chat from the server
-					const chat = await getChatById(localStorage.token, chatId).catch(() => null);
+					const chat = await getChatById(localStorage.token, targetChatId).catch(() => null);
+					if (chatId !== targetChatId) return;
 					if (chat?.chat?.history) {
 						history = chat.chat.history;
+						toast.error($i18n.t('This message anchors a side thread and cannot be deleted'));
+					} else {
+						// The refetch failed — fall back to the pre-delete snapshot so
+						// the rejected deletion isn't left applied in the view
+						history = historySnapshot;
+						toast.error($i18n.t('This message anchors a side thread and cannot be deleted'));
+						toast.error($i18n.t('Could not verify the deletion — the view was restored.'));
 					}
-					toast.error($i18n.t('This message anchors a side thread and cannot be deleted'));
 				} else {
 					toast.error(`${error}`);
 				}

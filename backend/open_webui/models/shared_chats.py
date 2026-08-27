@@ -69,23 +69,10 @@ async def _snapshot_chat_payload(chat) -> dict:
 
     chat_payload = chat.chat if isinstance(chat.chat, dict) else {}
     try:
-        from open_webui.utils.thread_context import assemble_thread_transcript
+        from open_webui.utils.thread_context import materialize_transcript_payload
 
-        target_message_id = getattr(chat, 'current_message_id', None) or (
-            (chat_payload.get('history') or {}).get('currentId')
-        )
-        transcript_history, transcript_messages = await assemble_thread_transcript(
-            chat, target_message_id, getattr(chat, 'user_id', None)
-        )
-        if not transcript_history.get('messages'):
-            return chat_payload
-
-        snapshot = {**chat_payload, 'history': transcript_history}
-        if 'messages' in snapshot:
-            snapshot['messages'] = transcript_messages
-        # A stale top-level currentId would contradict the rebuilt history.
-        snapshot.pop('currentId', None)
-        return snapshot
+        snapshot = await materialize_transcript_payload(chat, chat_payload)
+        return chat_payload if snapshot is None else snapshot
     except Exception:
         log.exception('Failed to materialize thread transcript for share snapshot of chat %s', chat.id)
         return chat_payload
@@ -235,6 +222,18 @@ class SharedChatsTable:
         try:
             async with get_async_db_context(db) as db:
                 await db.execute(delete(SharedChat).filter_by(chat_id=chat_id))
+                await db.commit()
+                return True
+        except Exception:
+            return False
+
+    async def delete_by_chat_ids(self, chat_ids: list[str], db: Optional[AsyncSession] = None) -> bool:
+        """Delete all shared chats for the given original chats in one statement."""
+        if not chat_ids:
+            return True
+        try:
+            async with get_async_db_context(db) as db:
+                await db.execute(delete(SharedChat).where(SharedChat.chat_id.in_(chat_ids)))
                 await db.commit()
                 return True
         except Exception:

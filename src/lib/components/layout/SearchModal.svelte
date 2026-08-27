@@ -51,6 +51,13 @@
 	let menuChatId = '';
 	let menuChatTitle = '';
 
+	// Thread descendant protection: the delete endpoint answers 409 with
+	// `descendant_count` when the chat has nested threads and no cascade was
+	// requested — surface a second confirmation, then retry with cascade=true.
+	let showCascadeDeleteConfirm = false;
+	let cascadeDeleteCount = 0;
+	let cascadeDeleteChatId = '';
+
 	let editingChatId = null;
 	let editingChatTitle = '';
 
@@ -117,22 +124,43 @@
 		}
 	};
 
+	const chatDeletedHandler = async (id) => {
+		chatList = chatList?.filter((c) => c.id !== id) ?? null;
+		tags.set(await getAllTags(localStorage.token));
+
+		if ($currentChatId === id) {
+			await goto('/');
+			currentChatId.set('');
+		}
+
+		await refreshSidebar();
+	};
+
 	const deleteChatHandler = async (id) => {
 		const res = await deleteChatById(localStorage.token, id).catch((error) => {
-			toast.error(`${error}`);
+			if (error?.descendant_count) {
+				cascadeDeleteChatId = id;
+				cascadeDeleteCount = error.descendant_count;
+				showCascadeDeleteConfirm = true;
+			} else {
+				toast.error(`${error?.message ?? error}`);
+			}
 			return null;
 		});
 
 		if (res) {
-			chatList = chatList?.filter((c) => c.id !== id) ?? null;
-			tags.set(await getAllTags(localStorage.token));
+			await chatDeletedHandler(id);
+		}
+	};
 
-			if ($currentChatId === id) {
-				await goto('/');
-				currentChatId.set('');
-			}
+	const cascadeDeleteChatHandler = async (id) => {
+		const res = await deleteChatById(localStorage.token, id, true).catch((error) => {
+			toast.error(`${error?.message ?? error}`);
+			return null;
+		});
 
-			await refreshSidebar();
+		if (res) {
+			await chatDeletedHandler(id);
 		}
 	};
 
@@ -572,6 +600,20 @@
 		{$i18n.t('This will delete')} <span class="font-normal">{menuChatTitle}</span>.
 	</div>
 </DeleteConfirmDialog>
+
+<DeleteConfirmDialog
+	bind:show={showCascadeDeleteConfirm}
+	title={$i18n.t('Delete chat?')}
+	message={$i18n.t(
+		'This thread contains {{count}} nested threads. Delete it and all nested threads?',
+		{
+			count: cascadeDeleteCount
+		}
+	)}
+	on:confirm={() => {
+		cascadeDeleteChatHandler(cascadeDeleteChatId);
+	}}
+/>
 
 <Modal size="xl" bind:show>
 	<div class="py-2.5 dark:text-gray-300 text-gray-700">
