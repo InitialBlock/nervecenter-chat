@@ -41,6 +41,7 @@
 	export let addMessages;
 	export let onToolCallResolved: Function = () => {};
 	export let forkHandler: Function | null = null;
+	export let startThreadHandler: Function | null = null;
 	export let triggerScroll;
 	export let readOnly = false;
 	export let allowDelete = true;
@@ -78,6 +79,7 @@
 				{showNextMessage}
 				{editMessage}
 				{deleteMessage}
+				{startThreadHandler}
 				{allowDelete}
 				{readOnly}
 				{compactPreview}
@@ -110,6 +112,7 @@
 				{addMessages}
 				{onToolCallResolved}
 				{forkHandler}
+				{startThreadHandler}
 				{readOnly}
 				{compactPreview}
 				{editCodeBlock}

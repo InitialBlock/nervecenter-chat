@@ -72,6 +72,7 @@
 		archiveChatById,
 		compactChatById,
 		createNewChat,
+		createThreadFromMessage,
 		deleteChatById,
 		forkChatById,
 		getAllTags,
@@ -3043,6 +3044,44 @@
 		}
 	};
 
+	const handleStartThread = async (messageId: string) => {
+		if (!$chatId || !history?.currentId) {
+			toast.message($i18n.t('No chat to start a thread from'));
+			return;
+		}
+
+		const currentMessage = history.messages?.[history.currentId];
+		if (
+			generating ||
+			taskIds?.length ||
+			(currentMessage?.role === 'assistant' && !currentMessage.done)
+		) {
+			toast.warning($i18n.t('Wait for the current response to finish before starting a thread.'));
+			return;
+		}
+
+		const toastId = toast.loading($i18n.t('Creating thread...'));
+
+		try {
+			const result = await createThreadFromMessage(localStorage.token, $chatId, messageId);
+
+			if (result?.id) {
+				if (!embedded) {
+					// thread tree refresh happens via load on navigation
+					await goto(`/c/${result.id}`);
+					await refreshChatList(localStorage.token, { refreshPinned: true });
+				}
+				toast.success($i18n.t('Thread created'), { id: toastId });
+			} else {
+				toast.error($i18n.t('Failed to create thread'), { id: toastId });
+			}
+		} catch (error) {
+			toast.error(`${error}`, { id: toastId });
+		} finally {
+			messageInput?.focus({ preventScroll: true });
+		}
+	};
+
 	const clearCommandInput = () => {
 		messageInput?.setText('');
 		prompt = '';
@@ -4397,6 +4436,7 @@
 										{onToolCallResolved}
 										allowDelete={!(generating || taskIds?.length)}
 										forkHandler={handleForkChat}
+										startThreadHandler={handleStartThread}
 										topPadding={!embedded}
 										bottomPadding={files.length > 0}
 										{onSelect}

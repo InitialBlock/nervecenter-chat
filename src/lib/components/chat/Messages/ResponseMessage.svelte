@@ -162,6 +162,7 @@
 	export let continueResponse: Function;
 	export let regenerateResponse: Function;
 	export let forkHandler: Function | null = null;
+	export let startThreadHandler: Function | null = null;
 
 	export let addMessages: Function;
 	export let onToolCallResolved: Function = () => {};
@@ -1518,6 +1519,36 @@
 													<path d="M17 4L20 7L17 10" />
 													<path d="M9 12C12.5 12 12.5 17 16 17H20" />
 													<path d="M17 14L20 17L17 20" />
+												</svg>
+											</button>
+										</Tooltip>
+									{/if}
+
+									{#if message.done && !readOnly && startThreadHandler}
+										<Tooltip content={$i18n.t('Start side thread')} placement="bottom">
+											<button
+												aria-label={$i18n.t('Start side thread')}
+												class="{isLastMessage || ($settings?.highContrastMode ?? false)
+													? 'visible'
+													: 'hover-reveal'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+												on:click={() => {
+													startThreadHandler?.(message.id);
+												}}
+											>
+												<svg
+													class="w-4 h-4"
+													viewBox="0 0 24 24"
+													fill="none"
+													stroke="currentColor"
+													stroke-width="1.8"
+													stroke-linecap="round"
+													stroke-linejoin="round"
+													aria-hidden="true"
+												>
+													<path d="M6 3v12" />
+													<circle cx="18" cy="6" r="3" />
+													<circle cx="6" cy="18" r="3" />
+													<path d="M18 9a9 9 0 0 1-9 9" />
 												</svg>
 											</button>
 										</Tooltip>

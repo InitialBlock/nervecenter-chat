@@ -6,7 +6,7 @@
 	const dispatch = createEventDispatcher();
 
 	import { toast } from 'svelte-sonner';
-	import { deleteChatMessageById, updateChatById } from '$lib/apis/chats';
+	import { deleteChatMessageById, getChatById, updateChatById } from '$lib/apis/chats';
 	import { copyToClipboard, extractCurlyBraceWords } from '$lib/utils';
 
 	import Message from './Messages/Message.svelte';
@@ -42,6 +42,7 @@
 	export let addMessages: Function = () => {};
 	export let onToolCallResolved: Function = () => {};
 	export let forkHandler: Function | null = null;
+	export let startThreadHandler: Function | null = null;
 
 	export let readOnly = false;
 	export let allowDelete = true;
@@ -493,9 +494,24 @@
 		history = history;
 
 		if (!$temporaryChatEnabled) {
-			const res = await deleteChatMessageById(localStorage.token, chatId, messageId);
-			if (res?.chat?.history) {
-				history = res.chat.history;
+			try {
+				const res = await deleteChatMessageById(localStorage.token, chatId, messageId);
+				if (res?.chat?.history) {
+					history = res.chat.history;
+				}
+			} catch (error: any) {
+				if (error?.branch_point_message_ids) {
+					// The deletion was rejected because a side thread branches from this
+					// message (or one of its children); restore the optimistically
+					// removed messages by refetching the chat from the server
+					const chat = await getChatById(localStorage.token, chatId).catch(() => null);
+					if (chat?.chat?.history) {
+						history = chat.chat.history;
+					}
+					toast.error($i18n.t('This message anchors a side thread and cannot be deleted'));
+				} else {
+					toast.error(`${error}`);
+				}
 			}
 
 			await refreshChatList(localStorage.token);
@@ -564,6 +580,7 @@
 								{addMessages}
 								{onToolCallResolved}
 								{forkHandler}
+								{startThreadHandler}
 								{allowDelete}
 								{triggerScroll}
 								{readOnly}
