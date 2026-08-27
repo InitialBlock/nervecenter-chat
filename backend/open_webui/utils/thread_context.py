@@ -291,3 +291,62 @@ async def assemble_thread_context_with_prefix(
     inherited_context = build_thread_context(ancestor_segments, ({}, None))
     own_context = build_thread_context([], (own_messages_map or {}, target_message_id))
     return [*inherited_context, *own_context], len(inherited_context)
+
+
+async def assemble_thread_transcript(
+    chat: Any,
+    target_message_id: Optional[str],
+    user_id: Optional[str] = None,
+    *,
+    max_depth: int = MAX_THREAD_DEPTH,
+    get_chat=None,
+    get_messages_map=None,
+) -> tuple[dict, list[dict]]:
+    """Materialize a thread's full inherited + own transcript as a history dict.
+
+    Resolves the thread's flattened context via
+    :func:`assemble_thread_context` and rebuilds it as a self-contained,
+    strictly linear Open WebUI ``history`` (fresh ``parentId``/``childrenIds``
+    links, ``currentId`` at the tail) — the shape share snapshots, clones, and
+    forks need so a thread copy is a full transcript rather than a
+    mid-conversation fragment (R16).
+
+    Every messages map fetched during assembly is recorded so per-message
+    fields the replay projection drops (``timestamp``, ``done``, ``models``,
+    ...) are restored from the real source messages; only messages with no
+    resolvable source get synthesized values. Same degradation semantics as
+    :func:`assemble_thread_context` — never raises for broken links.
+
+    :return: ``(history, ordered_messages)`` as produced by
+        ``build_transcript_history``.
+    """
+    if get_chat is None or get_messages_map is None:
+        # Imported lazily: see assemble_thread_context_with_prefix.
+        from open_webui.models.chats import Chats
+
+        get_chat = get_chat or Chats.get_chat_by_id
+        get_messages_map = get_messages_map or Chats.get_messages_map_by_chat_id
+
+    raw_messages_by_id: dict = {}
+
+    async def recording_get_messages_map(chat_id):
+        messages_map = await get_messages_map(chat_id)
+        for message_id, message in (messages_map or {}).items():
+            if isinstance(message, dict):
+                raw_messages_by_id.setdefault(message_id, message)
+        return messages_map
+
+    context = await assemble_thread_context(
+        chat,
+        target_message_id,
+        user_id,
+        max_depth=max_depth,
+        get_chat=get_chat,
+        get_messages_map=recording_get_messages_map,
+    )
+
+    # Lazy so this module stays importable with stdlib only (chat_fork is
+    # stdlib-only too, but keep the letter of the module contract).
+    from open_webui.utils.chat_fork import build_transcript_history
+
+    return build_transcript_history(context, raw_messages_by_id=raw_messages_by_id)

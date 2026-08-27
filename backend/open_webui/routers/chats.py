@@ -42,6 +42,7 @@ from open_webui.utils.auth import bearer_security, get_admin_user, get_current_u
 from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.misc import get_message_list
+from open_webui.utils.thread_context import assemble_thread_transcript
 from open_webui.utils.models import get_all_models
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1840,6 +1841,34 @@ async def pin_chat_by_id(
 ############################
 
 
+async def _materialize_thread_clone_chat(chat, updated_chat: dict) -> dict:
+    """Replace a thread clone's history with its materialized full transcript.
+
+    Normal chats (no ``parent_chat_id``) are returned untouched. For thread
+    chats the clone's ``history`` (and legacy ``messages`` list) becomes the
+    flattened inherited + own transcript so the clone is self-contained (R16).
+    The source chat row is never modified.
+    """
+    if not getattr(chat, 'parent_chat_id', None):
+        return updated_chat
+
+    transcript_history, transcript_messages = await assemble_thread_transcript(
+        chat,
+        chat.current_message_id or (chat.chat.get('history') or {}).get('currentId'),
+        chat.user_id,
+    )
+    if not transcript_history.get('messages'):
+        return updated_chat
+
+    updated_chat = {**updated_chat, 'history': transcript_history}
+    if 'messages' in updated_chat:
+        updated_chat['messages'] = transcript_messages
+    updated_chat['branchPointMessageId'] = transcript_history.get('currentId')
+    # A stale top-level currentId would contradict the rebuilt history.
+    updated_chat.pop('currentId', None)
+    return updated_chat
+
+
 class CloneForm(BaseModel):
     title: str | None = None
 
@@ -1885,6 +1914,32 @@ async def fork_chat_by_id(
     )
     if not source_message_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='chat has no messages to fork')
+
+    # Thread chats (R16): the fork's ancestor chain must include the context
+    # inherited from parent chats, so walk build_fork_history over the
+    # materialized full transcript (inherited segments up to their branch
+    # points + own chain) instead of the thread's own map. build_fork_history
+    # then truncates at source_message_id exactly as it does today — including
+    # when the forked message lies in an inherited segment. Normal chats never
+    # enter this branch.
+    if chat.parent_chat_id:
+
+        async def get_messages_map_with_own(chat_id, _own_id=chat.id, _own_map=messages_map):
+            # Reuse the map (with its legacy-history fallback) resolved above.
+            if chat_id == _own_id:
+                return _own_map
+            return await Chats.get_messages_map_by_chat_id(chat_id)
+
+        own_target_id = (
+            source_message_id
+            if source_message_id in messages_map
+            else chat.current_message_id or history.get('currentId')
+        )
+        transcript_history, _ = await assemble_thread_transcript(
+            chat, own_target_id, user.id, get_messages_map=get_messages_map_with_own
+        )
+        if transcript_history.get('messages'):
+            messages_map = transcript_history['messages']
 
     try:
         fork_history, fork_messages = build_fork_history(messages_map, source_message_id)
@@ -1957,6 +2012,10 @@ async def clone_chat_by_id(
             'branchPointMessageId': chat.chat['history']['currentId'],
             'title': form_data.title if form_data.title else f'Clone of {chat.title}',
         }
+        # Thread chats (R16): the clone must be a self-contained transcript
+        # (inherited + own), and — since import_chats never sets the
+        # server-controlled thread columns — an independent ROOT chat.
+        updated_chat = await _materialize_thread_clone_chat(chat, updated_chat)
 
         chats = await Chats.import_chats(
             user.id,
@@ -2041,6 +2100,9 @@ async def clone_shared_chat_by_id(
         'branchPointMessageId': chat.chat['history']['currentId'],
         'title': f'Clone of {chat.title}',
     }
+    # Shared snapshots are already materialized at share time; this only fires
+    # for the admin direct-by-chat-id fallback when that chat is a thread.
+    updated_chat = await _materialize_thread_clone_chat(chat, updated_chat)
 
     chats = await Chats.import_chats(
         user.id,

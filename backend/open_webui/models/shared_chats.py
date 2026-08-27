@@ -52,6 +52,45 @@ class SharedChatResponse(BaseModel):
     created_at: int
 
 
+async def _snapshot_chat_payload(chat) -> dict:
+    """Chat JSON to store in a share snapshot.
+
+    Normal chats: the chat JSON as-is (unchanged behavior). Thread chats
+    (``parent_chat_id`` set) would otherwise snapshot a mid-conversation
+    fragment, so their snapshot's ``history`` (and legacy ``messages`` list)
+    is replaced with the materialized full inherited + own transcript (R16).
+    The source chat row is never modified — only the snapshot copy differs.
+
+    Any unexpected failure degrades to the plain (fragment) snapshot with a
+    logged error rather than blocking the share.
+    """
+    if not getattr(chat, 'parent_chat_id', None):
+        return chat.chat  # normal chats: snapshot exactly what was stored before
+
+    chat_payload = chat.chat if isinstance(chat.chat, dict) else {}
+    try:
+        from open_webui.utils.thread_context import assemble_thread_transcript
+
+        target_message_id = getattr(chat, 'current_message_id', None) or (
+            (chat_payload.get('history') or {}).get('currentId')
+        )
+        transcript_history, transcript_messages = await assemble_thread_transcript(
+            chat, target_message_id, getattr(chat, 'user_id', None)
+        )
+        if not transcript_history.get('messages'):
+            return chat_payload
+
+        snapshot = {**chat_payload, 'history': transcript_history}
+        if 'messages' in snapshot:
+            snapshot['messages'] = transcript_messages
+        # A stale top-level currentId would contradict the rebuilt history.
+        snapshot.pop('currentId', None)
+        return snapshot
+    except Exception:
+        log.exception('Failed to materialize thread transcript for share snapshot of chat %s', chat.id)
+        return chat_payload
+
+
 ####################
 # Table Operations
 ####################
@@ -78,7 +117,7 @@ class SharedChatsTable:
                 chat_id=chat_id,
                 user_id=user_id,
                 title=chat.title,
-                chat=chat.chat,
+                chat=await _snapshot_chat_payload(chat),
                 created_at=now,
                 updated_at=now,
             )
@@ -104,7 +143,7 @@ class SharedChatsTable:
                 return None
 
             shared_chat.title = chat.title
-            shared_chat.chat = chat.chat
+            shared_chat.chat = await _snapshot_chat_payload(chat)
             shared_chat.updated_at = int(time.time())
 
             await db.commit()
