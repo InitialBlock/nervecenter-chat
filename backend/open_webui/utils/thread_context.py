@@ -121,7 +121,7 @@ def build_thread_context(
         own_chain = _get_message_chain(own_messages_map or {}, target_message_id)
         if not own_chain:
             log.warning(
-                'Thread context: target message %r not found in the thread\'s own history',
+                "Thread context: target message %r not found in the thread's own history",
                 target_message_id,
             )
         context.extend(_project_message(message, strip_context_summary=False) for message in own_chain)
@@ -238,8 +238,7 @@ async def assemble_thread_context_with_prefix(
     while parent_chat_id:
         if parent_chat_id in visited_chat_ids:
             log.warning(
-                'Thread context: cycle detected in parent chain at chat %s; '
-                'skipping root-most segments',
+                'Thread context: cycle detected in parent chain at chat %s; skipping root-most segments',
                 parent_chat_id,
             )
             break
@@ -261,15 +260,13 @@ async def assemble_thread_context_with_prefix(
             break
         if user_id is not None and getattr(ancestor, 'user_id', None) != user_id:
             log.warning(
-                'Thread context: ancestor chat %s is owned by a different user; '
-                'skipping root-most segments',
+                'Thread context: ancestor chat %s is owned by a different user; skipping root-most segments',
                 parent_chat_id,
             )
             break
         if not branch_from_message_id:
             log.warning(
-                'Thread context: missing branch_from_message_id for ancestor chat %s; '
-                'skipping root-most segments',
+                'Thread context: missing branch_from_message_id for ancestor chat %s; skipping root-most segments',
                 parent_chat_id,
             )
             break
