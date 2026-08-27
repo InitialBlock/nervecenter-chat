@@ -52,6 +52,8 @@
 	export let archiveChatHandler: (id: string) => void;
 	export let deleteChatHandler: (id: string) => void;
 	export let moveChatHandler: (id: string, folderId: string) => void;
+	export let showThreadNavigatorToggle: boolean = false;
+	export let onToggleThreadNavigator: (() => void) | null = null;
 
 	let closedBannerIds = [];
 
@@ -226,6 +228,35 @@
 								aria-label="New Chat"
 							>
 								<ChatPlus className="size-4.5" strokeWidth="1.5" />
+							</button>
+						</Tooltip>
+					{/if}
+
+					{#if showThreadNavigatorToggle && onToggleThreadNavigator}
+						<Tooltip content={$i18n.t('Thread tree')}>
+							<button
+								class="flex size-6 cursor-pointer items-center justify-center rounded-lg text-gray-500 transition hover:bg-gray-50/40 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-200"
+								id="thread-navigator-button"
+								on:click={() => {
+									onToggleThreadNavigator?.();
+								}}
+								aria-label={$i18n.t('Thread tree')}
+							>
+								<svg
+									class="size-4"
+									viewBox="0 0 24 24"
+									fill="none"
+									stroke="currentColor"
+									stroke-width="1.8"
+									stroke-linecap="round"
+									stroke-linejoin="round"
+									aria-hidden="true"
+								>
+									<path d="M6 3v12" />
+									<circle cx="18" cy="6" r="3" />
+									<circle cx="6" cy="18" r="3" />
+									<path d="M18 9a9 9 0 0 1-9 9" />
+								</svg>
 							</button>
 						</Tooltip>
 					{/if}

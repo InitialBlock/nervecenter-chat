@@ -66,6 +66,7 @@
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
+	import { buildThreadTree } from '$lib/utils/threads';
 	import { applyResponseStreamEvent, getOutputText } from './Messages/structuredOutput';
 
 	import {
@@ -78,6 +79,7 @@
 		getAllTags,
 		getChatById,
 		getTagsById,
+		getThreadTree,
 		resolveChatMessageToolCall,
 		updateChatById,
 		updateChatFolderIdById
@@ -111,6 +113,8 @@
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Navbar from '$lib/components/chat/Navbar.svelte';
 	import ChatControls from './ChatControls.svelte';
+	import ThreadNavigator from './ThreadNavigator.svelte';
+	import Drawer from '../common/Drawer.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 	import DeleteConfirmDialog from '../common/ConfirmDialog.svelte';
 	import WebSearchConfirmDialog from '../common/ConfirmDialog.svelte';
@@ -398,6 +402,62 @@
 	}
 
 	let chatTasks = [];
+
+	// Thread tree (hierarchical side threads)
+	let threadTreeNodes = [];
+	let threadTreeLoading = false;
+	let threadTreeError = false;
+	let showThreadNavigator = false;
+
+	$: threadTreeRoot = buildThreadTree(threadTreeNodes);
+	$: activeThreadNode = threadTreeNodes.find((node) => node.id === $chatId) ?? null;
+	$: threadParentNode = activeThreadNode?.parent_chat_id
+		? (threadTreeNodes.find((node) => node.id === activeThreadNode.parent_chat_id) ?? null)
+		: null;
+
+	const loadThreadTree = async (id) => {
+		if (!id || embedded || $temporaryChatEnabled || isTemporaryChatId(id)) {
+			threadTreeNodes = [];
+			threadTreeError = false;
+			threadTreeLoading = false;
+			return;
+		}
+
+		threadTreeLoading = true;
+		threadTreeError = false;
+
+		try {
+			const res = await getThreadTree(localStorage.token, id);
+			if ($chatId !== id) {
+				// A newer chat load owns the thread tree state now.
+				return;
+			}
+			threadTreeNodes = res?.nodes ?? [];
+		} catch (error) {
+			if ($chatId !== id) {
+				return;
+			}
+			// Keep any last-known tree so an open panel stays usable; the error
+			// state distinguishes a failed fetch from a single-thread workspace.
+			console.error('Failed to load thread tree', error);
+			threadTreeError = true;
+			toast.error($i18n.t('Failed to load thread tree'));
+		} finally {
+			if ($chatId === id) {
+				threadTreeLoading = false;
+			}
+		}
+	};
+
+	const selectThreadHandler = async (id) => {
+		if (!id || id === $chatId) {
+			return;
+		}
+		if ($mobile) {
+			showThreadNavigator = false;
+		}
+		await goto(`/c/${id}`);
+	};
 
 	let history = {
 		messages: {},
@@ -804,6 +864,16 @@
 		if ($chatId && $chatId !== chatIdProp && !$temporaryChatEnabled) {
 			noteChatDebug('marking outgoing chat read', { outgoingChatId: $chatId });
 			updateLastReadAt($chatId);
+		}
+
+		// Reset any stale generating UI from the outgoing chat so switching away
+		// from a generating chat never shows generating state on the destination.
+		// Generation itself is server-side and unaffected; loadChat reconciles
+		// active tasks for the incoming chat.
+		if (generating || generationController) {
+			generating = false;
+			generationController?.abort();
+			generationController = null;
 		}
 
 		clearTimeout(saveControlsTimer);
@@ -2130,6 +2200,11 @@
 		taskIds = null;
 		chatTasks = [];
 
+		threadTreeNodes = [];
+		threadTreeError = false;
+		threadTreeLoading = false;
+		showThreadNavigator = false;
+
 		if ($page.url.searchParams.get('youtube')) {
 			await uploadWeb(`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`);
 		}
@@ -2235,6 +2310,9 @@
 		// chatIdProp is empty for chats started from the home page (URL set via replaceState)
 		chatId.set(chatIdProp || $chatId);
 		noteChatDebug('loadChat set active chat id');
+
+		// Non-blocking: fetch the thread tree without delaying chat render
+		loadThreadTree($chatId);
 
 		if ($temporaryChatEnabled) {
 			noteChatDebug('loadChat disabling temporary chat');
@@ -4357,6 +4435,10 @@
 							{archiveChatHandler}
 							{deleteChatHandler}
 							{moveChatHandler}
+							showThreadNavigatorToggle={threadTreeNodes.length > 1}
+							onToggleThreadNavigator={() => {
+								showThreadNavigator = !showThreadNavigator;
+							}}
 							onSaveTempChat={async () => {
 								try {
 									if (!history?.currentId || !Object.keys(history.messages).length) {
@@ -4410,6 +4492,24 @@
 									isNearTop = messagesContainerElement.scrollTop <= 100;
 								}}
 							>
+								{#if !embedded && threadParentNode}
+									<div class="sticky top-0 z-20 flex h-0 justify-center pointer-events-none">
+										<div class="pt-12">
+											<button
+												class="pointer-events-auto flex max-w-full items-center gap-1 rounded-full border border-gray-100 dark:border-gray-850 bg-white/90 dark:bg-gray-900/90 backdrop-blur-sm px-3 py-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition"
+												on:click={() => {
+													selectThreadHandler(threadParentNode.id);
+												}}
+											>
+												<span class="truncate">
+													{$i18n.t('Branched from {{title}}', {
+														title: threadParentNode.title || $i18n.t('New Chat')
+													})}
+												</span>
+											</button>
+										</div>
+									</div>
+								{/if}
 								<div class=" h-full w-full flex flex-col">
 									<Messages
 										bind:this={messagesRef}
@@ -4660,6 +4760,88 @@
 						{/if}
 					</div>
 				</div>
+
+				{#if !embedded && showThreadNavigator && threadTreeNodes.length > 1}
+					{#if !$mobile}
+						<div
+							class="h-full w-72 max-w-full shrink-0 z-10 flex flex-col bg-white dark:bg-gray-900 border-s border-gray-50 dark:border-gray-850"
+						>
+							<div class="flex items-center justify-between px-3 pt-2 pb-2 shrink-0">
+								<div class="flex min-w-0 items-center gap-2">
+									<div class="truncate text-sm font-medium text-gray-700 dark:text-gray-200">
+										{$i18n.t('Thread tree')}
+									</div>
+									{#if threadTreeLoading}
+										<Spinner className="size-3" />
+									{/if}
+								</div>
+								<button
+									class="p-1 rounded-lg text-gray-500 dark:text-gray-400"
+									on:click={() => {
+										showThreadNavigator = false;
+									}}
+									aria-label={$i18n.t('Close')}
+								>
+									<XMark className="size-4" strokeWidth="2" />
+								</button>
+							</div>
+							{#if threadTreeError}
+								<div class="px-3 pb-1 text-xs text-red-500 dark:text-red-400 shrink-0">
+									{$i18n.t('Failed to load thread tree')}
+								</div>
+							{/if}
+							<div class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
+								<ThreadNavigator
+									threadTree={threadTreeRoot}
+									activeChatId={$chatId}
+									onSelect={selectThreadHandler}
+								/>
+							</div>
+						</div>
+					{:else}
+						<Drawer
+							show={showThreadNavigator}
+							onClose={() => {
+								showThreadNavigator = false;
+							}}
+							className="min-h-[100dvh] !bg-white dark:!bg-gray-850"
+						>
+							<div class="h-[100dvh] flex flex-col">
+								<div class="flex items-center justify-between px-3 pt-2 pb-2 shrink-0">
+									<div class="flex min-w-0 items-center gap-2">
+										<div class="truncate text-sm font-medium text-gray-700 dark:text-gray-200">
+											{$i18n.t('Thread tree')}
+										</div>
+										{#if threadTreeLoading}
+											<Spinner className="size-3" />
+										{/if}
+									</div>
+									<button
+										class="p-1 rounded-lg text-gray-500 dark:text-gray-400"
+										on:click={() => {
+											showThreadNavigator = false;
+										}}
+										aria-label={$i18n.t('Close')}
+									>
+										<XMark className="size-4" strokeWidth="2" />
+									</button>
+								</div>
+								{#if threadTreeError}
+									<div class="px-3 pb-1 text-xs text-red-500 dark:text-red-400 shrink-0">
+										{$i18n.t('Failed to load thread tree')}
+									</div>
+								{/if}
+								<div class="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
+									<ThreadNavigator
+										threadTree={threadTreeRoot}
+										activeChatId={$chatId}
+										onSelect={selectThreadHandler}
+									/>
+								</div>
+							</div>
+						</Drawer>
+					{/if}
+				{/if}
 
 				{#if !embedded}
 					<ChatControls
