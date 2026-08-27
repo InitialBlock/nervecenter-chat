@@ -359,17 +359,17 @@ Backend foundation (U1-U3) → backend integration and API (U4-U6) → frontend 
 
 ## Verification Contract
 
-| Gate | Command | Applies to | Done signal |
-|---|---|---|---|
-| Backend invariant tests | `pytest backend/open_webui/test/` (harness introduced in U3; pin exact invocation there) | U3, U4, U5, U6 | All pass; section 27 scenario green |
-| Listing exclusion smoke | API smoke once U5 lands: create a thread; sidebar/pinned/archived/folder/unread endpoints exclude it; search returns its messages | U2, U5 | No thread rows in listing responses; thread hits in search |
-| Frontend unit tests | `npm run test:frontend` | U8 | `buildThreadTree` suite passes |
-| Type check | `npm run check` | U7-U9 | No new errors |
-| Frontend lint | `npm run lint:frontend` | U7-U9 | Clean on touched files |
-| Backend format | `npm run format:backend` | U1-U6 | No diff after format |
-| Build | `npm run build` | all frontend units | Build succeeds |
-| Migration | app boot with `ENABLE_DB_MIGRATIONS` on a copy of a SQLite DB | U1 | Upgrade + downgrade clean; existing chats intact |
-| Acceptance smoke | manual walkthrough of the section 27 scenario in the running app | U4-U9 | Contexts, tree, isolation, and delete protection match AE1-AE3 |
+| Gate                    | Command                                                                                                                           | Applies to         | Done signal                                                    |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------ | -------------------------------------------------------------- |
+| Backend invariant tests | `pytest backend/open_webui/test/` (harness introduced in U3; pin exact invocation there)                                          | U3, U4, U5, U6     | All pass; section 27 scenario green                            |
+| Listing exclusion smoke | API smoke once U5 lands: create a thread; sidebar/pinned/archived/folder/unread endpoints exclude it; search returns its messages | U2, U5             | No thread rows in listing responses; thread hits in search     |
+| Frontend unit tests     | `npm run test:frontend`                                                                                                           | U8                 | `buildThreadTree` suite passes                                 |
+| Type check              | `npm run check`                                                                                                                   | U7-U9              | No new errors                                                  |
+| Frontend lint           | `npm run lint:frontend`                                                                                                           | U7-U9              | Clean on touched files                                         |
+| Backend format          | `npm run format:backend`                                                                                                          | U1-U6              | No diff after format                                           |
+| Build                   | `npm run build`                                                                                                                   | all frontend units | Build succeeds                                                 |
+| Migration               | app boot with `ENABLE_DB_MIGRATIONS` on a copy of a SQLite DB                                                                     | U1                 | Upgrade + downgrade clean; existing chats intact               |
+| Acceptance smoke        | manual walkthrough of the section 27 scenario in the running app                                                                  | U4-U9              | Contexts, tree, isolation, and delete protection match AE1-AE3 |
 
 ---
 
