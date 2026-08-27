@@ -247,25 +247,56 @@
 
 	let deleting = false;
 
+	// Thread descendant protection (U9): the delete endpoint answers 409 with
+	// `descendant_count` when the chat has nested threads and no cascade was
+	// requested — surface a second confirmation, then retry with cascade=true.
+	let showCascadeDeleteConfirm = false;
+	let cascadeDeleteCount = 0;
+
+	const chatDeletedHandler = async (id) => {
+		tags.set(await getAllTags(localStorage.token));
+		if ($chatId === id) {
+			await goto('/');
+
+			await chatId.set('');
+			await tick();
+		}
+
+		dispatch('change');
+	};
+
 	const deleteChatHandler = async (id) => {
 		if (deleting) return;
 		deleting = true;
 
 		const res = await deleteChatById(localStorage.token, id).catch((error) => {
+			if (error?.descendant_count) {
+				cascadeDeleteCount = error.descendant_count;
+				showCascadeDeleteConfirm = true;
+			} else {
+				toast.error(`${error}`);
+			}
+			return null;
+		});
+
+		if (res) {
+			await chatDeletedHandler(id);
+		}
+
+		deleting = false;
+	};
+
+	const cascadeDeleteChatHandler = async (id) => {
+		if (deleting) return;
+		deleting = true;
+
+		const res = await deleteChatById(localStorage.token, id, true).catch((error) => {
 			toast.error(`${error}`);
 			return null;
 		});
 
 		if (res) {
-			tags.set(await getAllTags(localStorage.token));
-			if ($chatId === id) {
-				await goto('/');
-
-				await chatId.set('');
-				await tick();
-			}
-
-			dispatch('change');
+			await chatDeletedHandler(id);
 		}
 
 		deleting = false;
@@ -565,6 +596,20 @@
 		{$i18n.t('This will delete')} <span class="  font-normal">{title}</span>.
 	</div>
 </DeleteConfirmDialog>
+
+<DeleteConfirmDialog
+	bind:show={showCascadeDeleteConfirm}
+	title={$i18n.t('Delete chat?')}
+	message={$i18n.t(
+		'This thread contains {{count}} nested threads. Delete it and all nested threads?',
+		{
+			count: cascadeDeleteCount
+		}
+	)}
+	on:confirm={() => {
+		cascadeDeleteChatHandler(id);
+	}}
+/>
 
 {#if dragged && x && y}
 	<DragGhost {x} {y}>

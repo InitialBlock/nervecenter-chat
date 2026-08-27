@@ -94,6 +94,7 @@
 	} from '$lib/apis/users';
 	import {
 		generateQueries,
+		generateTitle,
 		chatAction,
 		generateMoACompletion,
 		stopTask,
@@ -458,6 +459,132 @@
 		}
 		await goto(`/c/${id}`);
 	};
+
+	// U9: rename a thread from the navigator menu. Persists through the same
+	// title-update API ChatItem.svelte uses; the tree node is patched in place
+	// (a rename never changes the tree shape, so no refetch is needed).
+	const renameThreadHandler = async (id, title) => {
+		if (title === '') {
+			toast.error($i18n.t('Title cannot be an empty string.'));
+			return;
+		}
+
+		const res = await updateChatById(localStorage.token, id, { title }).catch((error) => {
+			toast.error(`${error}`);
+			return null;
+		});
+		if (!res) {
+			return;
+		}
+
+		if (id === $chatId) {
+			chatTitle.set(title);
+			// A manual rename supersedes the placeholder; never auto-title over it.
+			threadTitleAtLoad = null;
+		}
+		threadTreeNodes = threadTreeNodes.map((node) => (node.id === id ? { ...node, title } : node));
+	};
+
+	// U9: descendant-protected thread deletion.
+	let showThreadCascadeDeleteConfirm = false;
+	let threadCascadeDeleteTarget = null; // { id: string, count: number }
+
+	// Full subtree of `rootId` (inclusive) computed from the PRE-delete tree.
+	const getThreadSubtreeIds = (rootId) => {
+		const childrenByParent = {};
+		for (const node of threadTreeNodes) {
+			if (node.parent_chat_id) {
+				(childrenByParent[node.parent_chat_id] ??= []).push(node.id);
+			}
+		}
+
+		const ids = new Set([rootId]);
+		const queue = [rootId];
+		while (queue.length > 0) {
+			const current = queue.shift();
+			for (const childId of childrenByParent[current] ?? []) {
+				if (!ids.has(childId)) {
+					ids.add(childId);
+					queue.push(childId);
+				}
+			}
+		}
+		return ids;
+	};
+
+	// POST-DELETE NAVIGATION RULE: when the delete removed the currently viewed
+	// chat (i.e. the viewed chat is in the deleted node's subtree, computed from
+	// the pre-delete tree), navigate to the nearest surviving ancestor of the
+	// viewed chat — walk up the pre-delete tree past deleted nodes — falling
+	// back to '/' when the workspace root itself was deleted. Otherwise just
+	// refetch the tree in place.
+	const afterThreadDeleted = async (deletedId) => {
+		const deletedIds = getThreadSubtreeIds(deletedId);
+		const nodeById = Object.fromEntries(threadTreeNodes.map((node) => [node.id, node]));
+		const viewedId = $chatId;
+
+		// Root deletions affect the sidebar chat list.
+		await refreshChatList(localStorage.token, { refreshPinned: true });
+
+		if (viewedId && deletedIds.has(viewedId)) {
+			let survivorId = nodeById[viewedId]?.parent_chat_id ?? null;
+			while (survivorId && deletedIds.has(survivorId)) {
+				survivorId = nodeById[survivorId]?.parent_chat_id ?? null;
+			}
+
+			if (survivorId && nodeById[survivorId]) {
+				await goto(`/c/${survivorId}`);
+			} else {
+				// The workspace root itself was deleted.
+				initNewChat();
+				await goto('/');
+			}
+		} else {
+			await loadThreadTree(viewedId);
+		}
+	};
+
+	const deleteThreadHandler = async (id) => {
+		try {
+			const res = await deleteChatById(localStorage.token, id);
+			if (res) {
+				await afterThreadDeleted(id);
+				toast.success($i18n.t('Thread deleted.'));
+			}
+		} catch (error) {
+			// 409 with descendant_count: the thread has nested threads and needs
+			// an explicit cascade — ask for confirmation first.
+			if (error?.descendant_count) {
+				threadCascadeDeleteTarget = { id, count: error.descendant_count };
+				showThreadCascadeDeleteConfirm = true;
+			} else {
+				toast.error(`${error}`);
+			}
+		}
+	};
+
+	const confirmCascadeDeleteThread = async () => {
+		const target = threadCascadeDeleteTarget;
+		threadCascadeDeleteTarget = null;
+		if (!target) {
+			return;
+		}
+
+		try {
+			const res = await deleteChatById(localStorage.token, target.id, true);
+			if (res) {
+				await afterThreadDeleted(target.id);
+				toast.success($i18n.t('Thread deleted.'));
+			}
+		} catch (error) {
+			toast.error(`${error}`);
+		}
+	};
+
+	// U9 titling fallback state: the active thread's title as loaded, used to
+	// detect whether it is still the creation-time snippet placeholder.
+	let threadTitleAtLoad = null;
+	let threadTitleFallbackInFlight = false;
 
 	let history = {
 		messages: {},
@@ -2204,6 +2331,7 @@
 		threadTreeError = false;
 		threadTreeLoading = false;
 		showThreadNavigator = false;
+		threadTitleAtLoad = null;
 
 		if ($page.url.searchParams.get('youtube')) {
 			await uploadWeb(`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`);
@@ -2389,6 +2517,13 @@
 				sanitizeHistory(history);
 
 				chatTitle.set(chatContent.title);
+
+				// U9: remember a thread's title as loaded so the post-response
+				// titling fallback can tell whether it is still the
+				// creation-time snippet placeholder.
+				threadTitleAtLoad = chat?.parent_chat_id
+					? (chatContent.title ?? chat?.title ?? null)
+					: null;
 
 				params = structuredClone(chatContent?.params ?? {});
 				delete params.note_id;
@@ -2608,6 +2743,86 @@
 		// Just refresh the sidebar chat list.
 		if ($chatId == _chatId && !$temporaryChatEnabled) {
 			await refreshChatList(localStorage.token);
+			await threadTitleFallbackHandler(_chatId, modelId, messages);
+		}
+	};
+
+	// U9 titling fallback: the server-side background task (U4) is the primary
+	// title generator for threads; this only fires when a thread's title is
+	// still its creation-time placeholder after the first assistant response.
+	//
+	// "Server didn't retitle" cannot be detected reliably client-side, so the
+	// simpler documented rule is used: refetch the chat and only generate when
+	// its stored title still equals the title captured at load time (the
+	// snippet placeholder for a freshly created thread). Any server- or
+	// user-issued retitle changes the stored title first, which turns this
+	// into a no-op — the placeholder check keeps the two paths idempotent, so
+	// a server-generated title is never overwritten.
+	const threadTitleFallbackHandler = async (_chatId, modelId, messages) => {
+		if (embedded || threadTitleFallbackInFlight) {
+			return;
+		}
+		// Only thread chats (parent_chat_id set) that still carry their
+		// load-time title, and only after the FIRST assistant response of the
+		// thread's own history (regenerations of that first response included).
+		if (!threadTitleAtLoad || !chat?.parent_chat_id || chat?.id !== _chatId) {
+			return;
+		}
+		if ((messages ?? []).filter((message) => message.role === 'assistant').length !== 1) {
+			return;
+		}
+
+		threadTitleFallbackInFlight = true;
+		try {
+			const fresh = await getChatById(localStorage.token, _chatId).catch(() => null);
+			if (!fresh) {
+				// Transient fetch failure — keep the placeholder marker so a
+				// later completion can retry.
+				return;
+			}
+			const freshTitle = fresh?.chat?.title ?? fresh?.title ?? null;
+			if (!fresh?.parent_chat_id || freshTitle !== threadTitleAtLoad) {
+				// Already retitled (server task, another tab, or a manual
+				// rename) — mark the placeholder as consumed for good.
+				threadTitleAtLoad = null;
+				return;
+			}
+
+			const generatedTitle = await generateTitle(
+				localStorage.token,
+				modelId,
+				// The thread's OWN messages only — never the inherited context.
+				messages.map((message) => ({
+					role: message.role,
+					content: getOutputText(message.output) || message.content || ''
+				}))
+			).catch((error) => {
+				console.error('Thread title generation failed', error);
+				return null;
+			});
+
+			if (!generatedTitle || generatedTitle === threadTitleAtLoad) {
+				return;
+			}
+
+			const res = await updateChatById(localStorage.token, _chatId, {
+				title: generatedTitle
+			}).catch((error) => {
+				toast.error(`${error}`);
+				return null;
+			});
+			if (!res) {
+				return;
+			}
+
+			threadTitleAtLoad = null;
+			if ($chatId === _chatId) {
+				chatTitle.set(generatedTitle);
+			}
+			await loadThreadTree($chatId);
+			await refreshChatList(localStorage.token);
+		} finally {
+			threadTitleFallbackInFlight = false;
 		}
 	};
 
@@ -4238,8 +4453,16 @@
 				toast.success($i18n.t('Chat deleted.'));
 			}
 		} catch (error) {
-			console.error('Error deleting chat:', error);
-			toast.error(`${error}`);
+			// U9: the active chat can have thread descendants too — reuse the
+			// navigator's cascade confirmation (afterThreadDeleted handles the
+			// active-chat navigation).
+			if (error?.descendant_count) {
+				threadCascadeDeleteTarget = { id, count: error.descendant_count };
+				showThreadCascadeDeleteConfirm = true;
+			} else {
+				console.error('Error deleting chat:', error);
+				toast.error(`${error}`);
+			}
 		}
 	};
 </script>
@@ -4326,6 +4549,23 @@
 		{$i18n.t('This will delete')} <span class="  font-normal">{$chatTitle}</span>.
 	</div>
 </DeleteConfirmDialog>
+
+<DeleteConfirmDialog
+	bind:show={showThreadCascadeDeleteConfirm}
+	title={$i18n.t('Delete thread?')}
+	message={$i18n.t(
+		'This thread contains {{count}} nested threads. Delete it and all nested threads?',
+		{
+			count: threadCascadeDeleteTarget?.count ?? 0
+		}
+	)}
+	on:confirm={() => {
+		confirmCascadeDeleteThread();
+	}}
+	on:cancel={() => {
+		threadCascadeDeleteTarget = null;
+	}}
+/>
 
 <EventConfirmDialog
 	bind:show={showEventConfirmation}
@@ -4795,6 +5035,8 @@
 									threadTree={threadTreeRoot}
 									activeChatId={$chatId}
 									onSelect={selectThreadHandler}
+									onRenameThread={renameThreadHandler}
+									onDeleteThread={deleteThreadHandler}
 								/>
 							</div>
 						</div>
@@ -4836,6 +5078,8 @@
 										threadTree={threadTreeRoot}
 										activeChatId={$chatId}
 										onSelect={selectThreadHandler}
+										onRenameThread={renameThreadHandler}
+										onDeleteThread={deleteThreadHandler}
 									/>
 								</div>
 							</div>

@@ -12,9 +12,12 @@
 
 	export let onSelect: (id: string) => void = () => {};
 
-	// Extension point for U9: forwarded to each node so a rename/delete menu
-	// can be wired up later without changing the recursion.
-	export let onNodeMenu: ((node: ThreadTreeBranch, event: MouseEvent) => void) | null = null;
+	// U9: the per-node menu extension point, materialized as two typed
+	// callbacks forwarded to each node. Chat.svelte owns persistence
+	// (rename API call, descendant-protected delete) and tree refresh.
+	// Leave both unset for a read-only navigator (no menu is rendered).
+	export let onRenameThread: ((id: string, title: string) => void | Promise<void>) | null = null;
+	export let onDeleteThread: ((id: string) => void | Promise<void>) | null = null;
 
 	let treeElement: HTMLDivElement | null = null;
 
@@ -146,7 +149,8 @@
 			{expandedIds}
 			{focusedId}
 			onSelect={handleSelect}
-			{onNodeMenu}
+			{onRenameThread}
+			{onDeleteThread}
 			onToggle={setExpanded}
 			onKeydown={handleNodeKeydown}
 		/>
