@@ -52,6 +52,32 @@ class SharedChatResponse(BaseModel):
     created_at: int
 
 
+async def _snapshot_chat_payload(chat) -> dict:
+    """Chat JSON to store in a share snapshot.
+
+    Normal chats: the chat JSON as-is (unchanged behavior). Thread chats
+    (``parent_chat_id`` set) would otherwise snapshot a mid-conversation
+    fragment, so their snapshot's ``history`` (and legacy ``messages`` list)
+    is replaced with the materialized full inherited + own transcript (R16).
+    The source chat row is never modified — only the snapshot copy differs.
+
+    Any unexpected failure degrades to the plain (fragment) snapshot with a
+    logged error rather than blocking the share.
+    """
+    if not getattr(chat, 'parent_chat_id', None):
+        return chat.chat  # normal chats: snapshot exactly what was stored before
+
+    chat_payload = chat.chat if isinstance(chat.chat, dict) else {}
+    try:
+        from open_webui.utils.thread_context import materialize_transcript_payload
+
+        snapshot = await materialize_transcript_payload(chat, chat_payload)
+        return chat_payload if snapshot is None else snapshot
+    except Exception:
+        log.exception('Failed to materialize thread transcript for share snapshot of chat %s', chat.id)
+        return chat_payload
+
+
 ####################
 # Table Operations
 ####################
@@ -78,7 +104,7 @@ class SharedChatsTable:
                 chat_id=chat_id,
                 user_id=user_id,
                 title=chat.title,
-                chat=chat.chat,
+                chat=await _snapshot_chat_payload(chat),
                 created_at=now,
                 updated_at=now,
             )
@@ -104,7 +130,7 @@ class SharedChatsTable:
                 return None
 
             shared_chat.title = chat.title
-            shared_chat.chat = chat.chat
+            shared_chat.chat = await _snapshot_chat_payload(chat)
             shared_chat.updated_at = int(time.time())
 
             await db.commit()
@@ -196,6 +222,18 @@ class SharedChatsTable:
         try:
             async with get_async_db_context(db) as db:
                 await db.execute(delete(SharedChat).filter_by(chat_id=chat_id))
+                await db.commit()
+                return True
+        except Exception:
+            return False
+
+    async def delete_by_chat_ids(self, chat_ids: list[str], db: Optional[AsyncSession] = None) -> bool:
+        """Delete all shared chats for the given original chats in one statement."""
+        if not chat_ids:
+            return True
+        try:
+            async with get_async_db_context(db) as db:
+                await db.execute(delete(SharedChat).where(SharedChat.chat_id.in_(chat_ids)))
                 await db.commit()
                 return True
         except Exception:

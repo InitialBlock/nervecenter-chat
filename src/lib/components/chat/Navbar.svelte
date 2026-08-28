@@ -35,6 +35,7 @@
 	import ChatPlus from '../icons/ChatPlus.svelte';
 	import ChatCheck from '../icons/ChatCheck.svelte';
 	import Knobs from '../icons/Knobs.svelte';
+	import Branch from '../icons/Branch.svelte';
 	import { isTemporaryChatId } from '$lib/utils/chatId';
 
 	const i18n = getContext('i18n');
@@ -52,6 +53,8 @@
 	export let archiveChatHandler: (id: string) => void;
 	export let deleteChatHandler: (id: string) => void;
 	export let moveChatHandler: (id: string, folderId: string) => void;
+	export let showThreadNavigatorToggle: boolean = false;
+	export let onToggleThreadNavigator: (() => void) | null = null;
 
 	let closedBannerIds = [];
 
@@ -226,6 +229,21 @@
 								aria-label="New Chat"
 							>
 								<ChatPlus className="size-4.5" strokeWidth="1.5" />
+							</button>
+						</Tooltip>
+					{/if}
+
+					{#if showThreadNavigatorToggle && onToggleThreadNavigator}
+						<Tooltip content={$i18n.t('Thread tree')}>
+							<button
+								class="flex size-6 cursor-pointer items-center justify-center rounded-lg text-gray-500 transition hover:bg-gray-50/40 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-800/40 dark:hover:text-gray-200"
+								id="thread-navigator-button"
+								on:click={() => {
+									onToggleThreadNavigator?.();
+								}}
+								aria-label={$i18n.t('Thread tree')}
+							>
+								<Branch className="size-4" strokeWidth="1.8" />
 							</button>
 						</Tooltip>
 					{/if}

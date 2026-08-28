@@ -6,6 +6,7 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from typing import Any, Literal
 
 # local imports
@@ -152,6 +153,11 @@ class Chat(Base):  # database table mapping for chat entity
     last_read_at = Column(BigInteger, nullable=True)
     timer_at = Column(BigInteger, nullable=True)  # ns due time, set only while a timer chat waits to be claimed
 
+    # Thread hierarchy — server-controlled, never set from client form data
+    parent_chat_id = Column(Text, nullable=True)  # direct parent chat this thread branched from
+    branch_from_message_id = Column(Text, nullable=True)  # message in the parent the branch starts at
+    root_chat_id = Column(Text, nullable=True)  # top-level ancestor chat of the whole thread tree
+
     __table_args__ = (
         # Performance indexes for common queries
         Index('folder_id_idx', 'folder_id'),
@@ -176,11 +182,150 @@ class Chat(Base):  # database table mapping for chat entity
         ),
         # covering index: lets SQLite serve count_unread_by_folder_ids without reading chat rows
         Index('user_id_folder_unread_idx', 'user_id', 'folder_id', 'archived', 'updated_at', 'last_read_at', 'id'),
+        # Thread hierarchy lookups
+        Index('parent_chat_id_idx', 'parent_chat_id'),
+        Index('root_chat_id_idx', 'root_chat_id'),
+        Index('parent_chat_branch_message_idx', 'parent_chat_id', 'branch_from_message_id'),
     )
 
 
 def is_internal_chat(meta: dict | None) -> bool:
     return bool(meta and meta.get('internal') is True)
+
+
+def visible_chat_filter():
+    """SQLAlchemy criterion selecting chats that belong on normal listing surfaces.
+
+    Excludes internal chats (``meta.internal`` is true) and thread chats
+    (``parent_chat_id`` is set). Apply this to every user-facing listing/count
+    site (sidebar lists, pinned, archived, folders, tags, unread) instead of
+    composing the internal-chat exclusion inline (KTD5).
+
+    Deliberately NOT applied to search (``get_chats_by_user_id_and_search_text``
+    keeps its own inline internal filter so thread messages stay searchable, R14)
+    or to admin/all-chats paths.
+    """
+    return and_(
+        Chat.meta['internal'].as_boolean().is_not(True),
+        Chat.parent_chat_id.is_(None),
+    )
+
+
+####################
+# Thread hierarchy — pure helpers (no DB; unit-tested directly)
+####################
+
+THREAD_TITLE_MAX_LENGTH = 50
+DEFAULT_THREAD_TITLE = 'New Thread'
+
+
+def thread_title_from_message(message: dict | None, max_length: int = THREAD_TITLE_MAX_LENGTH) -> str:
+    """Default title for a thread branched from *message*.
+
+    Whitespace-collapsed snippet of the branch-source message content,
+    truncated to *max_length* characters (with an ellipsis); falls back to
+    ``'New Thread'`` when the message has no usable text content.
+    """
+    content = message.get('content') if isinstance(message, dict) else None
+    if not isinstance(content, str):
+        content = ''
+
+    snippet = ' '.join(content.split())
+    if not snippet:
+        return DEFAULT_THREAD_TITLE
+    if len(snippet) > max_length:
+        snippet = snippet[:max_length].rstrip() + '…'
+    return snippet
+
+
+def collect_thread_subtree_ids(chat_id: str, children_by_parent: dict[str, list[str]]) -> list[str]:
+    """Collect the full thread subtree rooted at *chat_id* (inclusive).
+
+    Pure BFS over an adjacency mapping ``parent_chat_id -> [child ids]``:
+    no DB, no recursion (deep chains are safe), visited-set cycle guard so a
+    corrupted parent pointer loop always terminates. Returns ids in BFS
+    order, starting with *chat_id* itself; descendants are the tail.
+    """
+    subtree_ids = [chat_id]
+    visited_ids = {chat_id}
+    queue = deque([chat_id])
+
+    while queue:
+        current_id = queue.popleft()
+        for child_id in children_by_parent.get(current_id, []):
+            if child_id and child_id not in visited_ids:
+                visited_ids.add(child_id)
+                subtree_ids.append(child_id)
+                queue.append(child_id)
+
+    return subtree_ids
+
+
+async def expand_ids_with_live_children(ids: set[str], fetch_new_child_ids, max_iterations: int = 50) -> set[str]:
+    """Expand *ids* with every live thread child until a fixed point.
+
+    Closes the TOCTOU window between a caller's subtree snapshot and the
+    actual delete: a thread created concurrently under any chat in the set
+    (grandchildren included) is picked up here, inside the delete
+    transaction, instead of becoming an invisible orphan.
+
+    Pure over an injected fetcher so it is testable without a DB:
+    ``fetch_new_child_ids`` is ``async (current_ids: set[str]) -> iterable of
+    child ids`` whose parent is in *current_ids* but which are not themselves
+    members. The set only ever grows and members are excluded from each round,
+    so a corrupted parent-pointer cycle cannot loop; ``max_iterations`` bounds
+    the walk regardless (one iteration per generation of new descendants).
+    """
+    expanded = set(ids)
+    for _ in range(max_iterations):
+        new_child_ids = {child_id for child_id in await fetch_new_child_ids(expanded) if child_id not in expanded}
+        if not new_child_ids:
+            break
+        expanded |= new_child_ids
+    return expanded
+
+
+async def revalidate_thread_anchor(thread_id: str, fetch_parent, fetch_branch_message, delete_thread) -> str | None:
+    """Re-check a freshly inserted thread row's anchor; undo the insert if gone.
+
+    Create side of a two-sided invariant with the cascade delete: a delete
+    that *starts* after the thread insert commits re-expands its id set
+    inside the delete transaction (:func:`expand_ids_with_live_children`)
+    and sweeps the new row up; a delete that *commits* between the create
+    endpoint's validations and its insert is caught here — the anchor
+    (parent chat / branch message) is re-checked once the new row is
+    visible, and the row is removed if the anchor vanished. Together the
+    two sides ensure a thread row never silently outlives its anchor.
+
+    Pure over injected async callables so it is testable without a DB:
+    ``fetch_parent()`` returns the parent chat or ``None``;
+    ``fetch_branch_message(parent)`` returns the branch message dict or
+    ``None``; ``delete_thread(thread_id)`` removes the just-inserted row.
+    Returns ``'chat'`` or ``'message'`` naming what vanished (after
+    deleting the thread row), or ``None`` when the anchor still holds.
+    """
+    parent = await fetch_parent()
+    if parent is None:
+        await delete_thread(thread_id)
+        return 'chat'
+    if await fetch_branch_message(parent) is None:
+        await delete_thread(thread_id)
+        return 'message'
+    return None
+
+
+def _ids_removed_by_delete(message_id: str, message: dict, messages: dict) -> set[str]:
+    """Ids removed when *message_id* is deleted from a history messages map.
+
+    Message deletion is never single: the message's direct children (those
+    present in *messages*) go with it; grandchildren are re-parented, not
+    removed. Single source of truth for ``get_message_deletion_ids`` and
+    ``delete_message_from_history``.
+    """
+    return {
+        message_id,
+        *(child_id for child_id in (message.get('childrenIds') or []) if child_id in messages),
+    }
 
 
 class ChatModel(BaseModel):
@@ -207,6 +352,11 @@ class ChatModel(BaseModel):
 
     last_read_at: int | None = None
     timer_at: int | None = None
+
+    # Thread hierarchy — server-controlled, never populated from client form data
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    root_chat_id: str | None = None
 
     @field_validator('variables', mode='before')
     @classmethod
@@ -295,6 +445,11 @@ class ChatResponse(BaseModel):
     current_message_id: str | None = None
     context_usage: dict | None = None
 
+    # Thread hierarchy — server-controlled, never populated from client form data
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    root_chat_id: str | None = None
+
     @field_validator('variables', mode='before')
     @classmethod
     def normalize_variables(cls, value):
@@ -309,6 +464,36 @@ class ChatTitleIdResponse(BaseModel):
     last_read_at: int | None = None
     snippet: str | None = None
     active: bool = False
+
+
+class ChatThreadNode(BaseModel):
+    """Flat lightweight node of a workspace thread tree (KTD9)."""
+
+    id: str
+    title: str
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    created_at: int
+    updated_at: int
+
+
+class ChatThreadTreeResponse(BaseModel):
+    root_chat_id: str
+    nodes: list[ChatThreadNode]
+
+
+class ChatThreadPointer(BaseModel):
+    """Thread-pointer projection of a chat row — no JSON blob.
+
+    Exactly what the thread-context ancestor walk reads from each ancestor
+    (via ``getattr``): identity, ownership, and the three thread columns.
+    """
+
+    id: str
+    user_id: str
+    parent_chat_id: str | None = None
+    branch_from_message_id: str | None = None
+    root_chat_id: str | None = None
 
 
 class SharedChatResponse(BaseModel):
@@ -523,6 +708,11 @@ class ChatTable:
         *,
         internal_meta: dict | None = None,
         timer_at: int | None = None,
+        # Thread hierarchy — server-controlled: settable only via these explicit
+        # parameters (a thread-creation endpoint), never from client form data.
+        parent_chat_id: str | None = None,
+        branch_from_message_id: str | None = None,
+        root_chat_id: str | None = None,
     ) -> ChatModel | None:
         async with get_async_db_context(db) as session:
             chat = ChatModel(
@@ -538,6 +728,9 @@ class ChatTable:
                     'timer_at': timer_at,
                     'variables': form_data.variables or {},
                     'current_message_id': self.get_current_message_id(form_data.chat),
+                    'parent_chat_id': parent_chat_id,
+                    'branch_from_message_id': branch_from_message_id,
+                    'root_chat_id': root_chat_id,
                     'created_at': int(time.time()),
                     'updated_at': int(time.time()),
                     'last_read_at': int(time.time()),
@@ -581,6 +774,112 @@ class ChatTable:
                 )
             )
             return list(result.scalars().all())
+
+    async def get_thread_subtree_ids(self, chat_id: str, user_id: str, db: AsyncSession | None = None) -> list[str]:
+        """Full thread subtree rooted at *chat_id* (inclusive), owner-scoped.
+
+        One indexed query (``root_chat_id_idx``) builds the workspace's
+        parent -> children adjacency, then the pure cycle-guarded BFS
+        (:func:`collect_thread_subtree_ids`) restricts it to the subtree of
+        *chat_id*. User-scoped so foreign rows are never collected even if a
+        cross-user pointer ever exists. Returns ``[]`` when the chat does not
+        exist (or is not owned by *user_id*); otherwise the first element is
+        *chat_id* itself and the tail is its thread descendants.
+        """
+        async with get_async_db_context(db) as session:
+            result = await session.execute(select(Chat.root_chat_id).filter_by(id=chat_id, user_id=user_id))
+            row = result.first()
+            if row is None:
+                return []
+            root_chat_id = row[0] or chat_id
+
+            result = await session.execute(
+                select(Chat.id, Chat.parent_chat_id).where(
+                    Chat.user_id == user_id,
+                    Chat.root_chat_id == root_chat_id,
+                )
+            )
+            children_by_parent: dict[str, list[str]] = {}
+            for descendant_id, parent_id in result.all():
+                if parent_id:
+                    children_by_parent.setdefault(parent_id, []).append(descendant_id)
+
+            return collect_thread_subtree_ids(chat_id, children_by_parent)
+
+    async def get_thread_tree_nodes(
+        self, root_chat_id: str, user_id: str, db: AsyncSession | None = None
+    ) -> list[ChatThreadNode]:
+        """Workspace root plus every chat with that ``root_chat_id``, as flat
+        lightweight nodes (KTD9). One indexed query, owner-scoped.
+        """
+        async with get_async_db_context(db) as session:
+            result = await session.execute(
+                select(
+                    Chat.id,
+                    Chat.title,
+                    Chat.parent_chat_id,
+                    Chat.branch_from_message_id,
+                    Chat.created_at,
+                    Chat.updated_at,
+                )
+                .where(
+                    Chat.user_id == user_id,
+                    or_(Chat.id == root_chat_id, Chat.root_chat_id == root_chat_id),
+                )
+                .order_by(Chat.created_at.asc(), Chat.id.asc())
+            )
+            return [ChatThreadNode(**dict(row._mapping)) for row in result.all()]
+
+    async def get_chat_thread_pointer_by_id(self, id: str, db: AsyncSession | None = None) -> ChatThreadPointer | None:
+        """Thread-pointer columns of a chat, without loading the JSON blob.
+
+        Default ancestor fetcher of the thread-context walk
+        (``open_webui/utils/thread_context.py``): each ancestor only
+        contributes its ownership and thread pointers, so selecting the five
+        small columns avoids deserializing every ancestor's full chat JSON.
+        """
+        try:
+            async with get_async_db_context(db) as session:
+                result = await session.execute(
+                    select(
+                        Chat.id,
+                        Chat.user_id,
+                        Chat.parent_chat_id,
+                        Chat.branch_from_message_id,
+                        Chat.root_chat_id,
+                    ).where(Chat.id == id)
+                )
+                row = result.first()
+                if row is None:
+                    return None
+                return ChatThreadPointer(**dict(row._mapping))
+        except Exception:
+            return None
+
+    async def get_thread_branch_point_message_ids(
+        self,
+        parent_chat_id: str,
+        user_id: str,
+        message_ids: set[str] | list[str],
+        db: AsyncSession | None = None,
+    ) -> set[str]:
+        """Subset of *message_ids* that are the ``branch_from_message_id`` of an
+        existing child thread of *parent_chat_id* (indexed lookup on
+        ``(parent_chat_id, branch_from_message_id)``).
+        """
+        message_ids = [message_id for message_id in message_ids if message_id]
+        if not message_ids:
+            return set()
+
+        async with get_async_db_context(db) as session:
+            result = await session.execute(
+                select(Chat.branch_from_message_id).where(
+                    Chat.parent_chat_id == parent_chat_id,
+                    Chat.user_id == user_id,
+                    Chat.branch_from_message_id.in_(message_ids),
+                )
+            )
+            return set(result.scalars().all())
 
     async def get_internal_chat_by_note_id(
         self, note_id: str, user_id: str, db: AsyncSession | None = None
@@ -804,7 +1103,7 @@ class ChatTable:
                     Chat.user_id == user_id,
                     Chat.folder_id.in_(folder_ids),
                     Chat.archived == False,
-                    Chat.meta['internal'].as_boolean().is_not(True),
+                    visible_chat_filter(),
                 )
                 .values(last_read_at=Chat.updated_at)
             )
@@ -818,7 +1117,7 @@ class ChatTable:
                 .where(
                     Chat.user_id == user_id,
                     Chat.archived == False,
-                    Chat.meta['internal'].as_boolean().is_not(True),
+                    visible_chat_filter(),
                 )
                 .values(last_read_at=Chat.updated_at)
             )
@@ -914,6 +1213,21 @@ class ChatTable:
         return {**(existing_history or {}), **(incoming_history or {}), 'messages': merged, 'currentId': current_id}
 
     @staticmethod
+    def get_message_deletion_ids(history: dict, message_id: str) -> set[str]:
+        """Ids :meth:`delete_message_from_history` would remove, without mutating.
+
+        Message deletion is never single: the message's direct children go
+        with it (grandchildren are re-parented, not removed). Used to guard
+        branch-point messages before committing a delete.
+        """
+        messages = (history or {}).get('messages') or {}
+        message = messages.get(message_id)
+        if not isinstance(message, dict):
+            return set()
+
+        return _ids_removed_by_delete(message_id, message, messages)
+
+    @staticmethod
     def delete_message_from_history(history: dict, message_id: str) -> set[str]:
         messages = history.get('messages') or {}
         message = messages.get(message_id)
@@ -921,7 +1235,9 @@ class ChatTable:
             return set()
 
         parent_id = message.get('parentId')
-        child_ids = [child_id for child_id in (message.get('childrenIds') or []) if child_id in messages]
+        deleted_ids = _ids_removed_by_delete(message_id, message, messages)
+        # Ordered view of the removed children (order matters for re-linking).
+        child_ids = [child_id for child_id in (message.get('childrenIds') or []) if child_id in deleted_ids]
         grandchild_ids = [
             grandchild_id
             for child_id in child_ids
@@ -937,7 +1253,6 @@ class ChatTable:
         for grandchild_id in grandchild_ids:
             messages[grandchild_id]['parentId'] = parent_id
 
-        deleted_ids = {message_id, *child_ids}
         for deleted_id in deleted_ids:
             messages.pop(deleted_id, None)
 
@@ -1398,7 +1713,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at).filter_by(
                 user_id=user_id, archived=True
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
 
             if filter:
                 query_key = filter.get('query')
@@ -1447,7 +1762,7 @@ class ChatTable:
     ) -> int:
         async with get_async_db_context(db) as session:
             stmt = select(func.count(Chat.id)).filter_by(user_id=user_id, archived=True)
-            result = await session.execute(stmt.where(Chat.meta['internal'].as_boolean().is_not(True)))
+            result = await session.execute(stmt.where(visible_chat_filter()))
             return result.scalar() or 0
 
     async def get_shared_chat_list_by_user_id(
@@ -1476,7 +1791,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             if not include_archived:
                 stmt = stmt.filter_by(archived=False)
 
@@ -1534,7 +1849,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
 
             if not include_folders:
                 stmt = stmt.filter_by(folder_id=None)
@@ -1577,7 +1892,7 @@ class ChatTable:
     ) -> list[ChatModel]:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).filter(Chat.id.in_(chat_ids)).filter_by(archived=False)
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
             all_chats = result.scalars().all()
             return [ChatModel.model_validate(chat) for chat in all_chats]
@@ -1814,6 +2129,7 @@ class ChatTable:
                     Chat.archived == False,
                     Chat.updated_at > func.coalesce(Chat.last_read_at, 0),
                     ~unfinished_assistant,
+                    visible_chat_filter(),
                 )
                 .group_by(Chat.folder_id)
             )
@@ -1867,7 +2183,7 @@ class ChatTable:
     ) -> ChatListResponse:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).filter_by(user_id=user_id)
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
 
             if filter:
                 if filter.get('updated_at'):
@@ -1914,7 +2230,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id, pinned=True, archived=False
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
             all_chats = result.all()
             return [
@@ -1933,7 +2249,7 @@ class ChatTable:
     async def get_archived_chats_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> list[ChatModel]:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).filter_by(user_id=user_id, archived=True)
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
             return [ChatModel.model_validate(chat) for chat in result.scalars().all()]
 
@@ -2146,7 +2462,7 @@ class ChatTable:
                 .filter_by(folder_id=folder_id, user_id=user_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
             )
             stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir))
 
@@ -2187,7 +2503,7 @@ class ChatTable:
                 .filter_by(folder_id=folder_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
             )
             stmt = stmt.order_by(*chat_list_order(sort_by, sort_dir, unread_for_user_id))
 
@@ -2221,7 +2537,7 @@ class ChatTable:
                 .filter_by(folder_id=folder_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
             )
             result = await session.execute(stmt)
             return result.scalar_one()
@@ -2235,7 +2551,7 @@ class ChatTable:
                 .filter(Chat.folder_id.in_(folder_ids), Chat.user_id == user_id)
                 .filter(or_(Chat.pinned == False, Chat.pinned == None))
                 .filter_by(archived=False)
-                .where(Chat.meta['internal'].as_boolean().is_not(True))
+                .where(visible_chat_filter())
                 .order_by(Chat.updated_at.desc())
             )
 
@@ -2285,7 +2601,7 @@ class ChatTable:
             stmt = select(Chat.id, Chat.title, Chat.updated_at, Chat.created_at, Chat.last_read_at).filter_by(
                 user_id=user_id
             )
-            stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+            stmt = stmt.where(visible_chat_filter())
             tag_id = tag_name.replace(' ', '_').lower()
 
             bind = await session.connection()
@@ -2368,7 +2684,7 @@ class ChatTable:
             for index, tag_id in enumerate(tag_ids):
                 tag_id = tag_id.replace(' ', '_').lower()
                 stmt = select(func.count(Chat.id)).filter_by(user_id=user_id, archived=False)
-                stmt = stmt.where(Chat.meta['internal'].as_boolean().is_not(True))
+                stmt = stmt.where(visible_chat_filter())
                 param = f'tag_id_{index}'
                 if dialect_name == 'sqlite':
                     stmt = stmt.filter(
@@ -2414,7 +2730,7 @@ class ChatTable:
     ) -> int:
         async with get_async_db_context(db) as session:
             stmt = select(func.count(Chat.id)).filter_by(user_id=user_id, folder_id=folder_id)
-            result = await session.execute(stmt.where(Chat.meta['internal'].as_boolean().is_not(True)))
+            result = await session.execute(stmt.where(visible_chat_filter()))
             count = result.scalar()
 
             log.info("Count of chats for folder '%s': %s", folder_id, count)
@@ -2428,10 +2744,32 @@ class ChatTable:
 
         async with get_async_db_context(db) as session:
             stmt = select(func.count(Chat.id)).filter(Chat.user_id == user_id, Chat.folder_id.in_(folder_ids))
-            result = await session.execute(stmt.where(Chat.meta['internal'].as_boolean().is_not(True)))
+            result = await session.execute(stmt.where(visible_chat_filter()))
             count = result.scalar()
 
             log.info("Count of chats for folders '%s': %s", folder_ids, count)
+            return count
+
+    async def count_all_chats_by_folder_ids_and_user_id(
+        self, folder_ids: list[str], user_id: str, db: AsyncSession | None = None
+    ) -> int:
+        """Unfiltered count of every chat row in *folder_ids* for *user_id*.
+
+        Unlike :meth:`count_chats_by_folder_ids_and_user_id`, this does NOT
+        apply :func:`visible_chat_filter`, so thread chats and internal chats
+        are included. Use it for authorization gates that must count what
+        deletion actually removes (``delete_chats_by_user_id_and_folder_id``
+        deletes all rows regardless of visibility), not for listing surfaces.
+        """
+        if not folder_ids:
+            return 0
+
+        async with get_async_db_context(db) as session:
+            stmt = select(func.count(Chat.id)).filter(Chat.user_id == user_id, Chat.folder_id.in_(folder_ids))
+            result = await session.execute(stmt)
+            count = result.scalar()
+
+            log.info("Total count of chats (incl. threads) for folders '%s': %s", folder_ids, count)
             return count
 
     async def delete_tag_by_id_and_user_id_and_tag_name(
@@ -2477,6 +2815,49 @@ class ChatTable:
         except Exception:
             return False
 
+    async def delete_chats_by_ids_and_user_id(
+        self, ids: list[str], user_id: str, db: AsyncSession | None = None
+    ) -> bool:
+        """Delete several chats (rows + chat_message rows) in one transaction.
+
+        Owner-scoped. Used by the thread-cascade delete paths so a subtree is
+        removed atomically — either every chat in the set goes or none does.
+
+        The id set is re-expanded here, inside the delete transaction, with
+        any owner-scoped thread children created after the caller snapshotted
+        its subtree (:func:`expand_ids_with_live_children`), so a thread
+        racing the cascade delete cannot survive as an invisible orphan.
+        """
+        from open_webui.models.shared_chats import SharedChats
+
+        if not ids:
+            return True
+        try:
+            async with get_async_db_context(db) as session:
+
+                async def fetch_new_child_ids(current_ids: set[str]) -> list[str]:
+                    result = await session.execute(
+                        select(Chat.id).where(
+                            Chat.user_id == user_id,
+                            Chat.parent_chat_id.in_(current_ids),
+                            Chat.id.not_in(current_ids),
+                        )
+                    )
+                    return list(result.scalars().all())
+
+                chat_ids = list(await expand_ids_with_live_children(set(ids), fetch_new_child_ids))
+
+                await session.execute(
+                    update(AutomationRun).filter(AutomationRun.chat_id.in_(chat_ids)).values(chat_id=None)
+                )
+                await session.execute(delete(ChatMessage).filter(ChatMessage.chat_id.in_(chat_ids)))
+                await session.execute(delete(Chat).filter(Chat.id.in_(chat_ids), Chat.user_id == user_id))
+                await session.commit()
+
+                return True and await SharedChats.delete_by_chat_ids(chat_ids, db=session)
+        except Exception:
+            return False
+
     async def delete_chats_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> bool:
         try:
             async with get_async_db_context(db) as session:
@@ -2503,15 +2884,46 @@ class ChatTable:
     ) -> bool:
         try:
             async with get_async_db_context(db) as session:
-                chat_ids_stmt = select(Chat.id).filter_by(user_id=user_id, folder_id=folder_id)
-                await session.execute(
-                    update(AutomationRun).filter(AutomationRun.chat_id.in_(chat_ids_stmt)).values(chat_id=None)
+                result = await session.execute(
+                    select(Chat.id, Chat.root_chat_id).filter_by(user_id=user_id, folder_id=folder_id)
                 )
-                await session.execute(delete(ChatMessage).filter(ChatMessage.chat_id.in_(chat_ids_stmt)))
-                await session.execute(delete(Chat).filter_by(user_id=user_id, folder_id=folder_id))
-                await session.commit()
+                folder_chats = result.all()
 
-                return True
+                # Expand each contained chat to its full thread subtree so folder
+                # deletion never orphans threads. Threads copy the parent's
+                # folder_id, so most are already in the folder set; the union
+                # picks up any that were moved out of the folder. Batched like
+                # get_thread_tree_nodes: the folder query above resolves the
+                # workspace roots, one indexed query fetches every workspace's
+                # parent -> children adjacency, then the pure cycle-guarded BFS
+                # (:func:`collect_thread_subtree_ids`) runs locally per chat.
+                chat_ids: set[str] = {chat_id for chat_id, _ in folder_chats}
+                root_chat_ids = {root_chat_id or chat_id for chat_id, root_chat_id in folder_chats}
+
+                children_by_parent: dict[str, list[str]] = {}
+                if root_chat_ids:
+                    result = await session.execute(
+                        select(Chat.id, Chat.parent_chat_id).where(
+                            Chat.user_id == user_id,
+                            or_(Chat.root_chat_id.in_(root_chat_ids), Chat.id.in_(root_chat_ids)),
+                        )
+                    )
+                    for descendant_id, parent_id in result.all():
+                        if parent_id:
+                            children_by_parent.setdefault(parent_id, []).append(descendant_id)
+
+                expanded: set[str] = set()
+                for chat_id, _ in folder_chats:
+                    if chat_id in expanded:
+                        continue  # already covered by a previously collected subtree
+                    subtree_chat_ids = collect_thread_subtree_ids(chat_id, children_by_parent)
+                    chat_ids.update(subtree_chat_ids)
+                    expanded.update(subtree_chat_ids)
+
+                if not chat_ids:
+                    return True
+
+                return await self.delete_chats_by_ids_and_user_id(list(chat_ids), user_id, db=session)
         except Exception:
             return False
 

@@ -1031,6 +1031,71 @@ export const forkChatById = async (token: string, id: string, messageId?: string
 	return res;
 };
 
+export const createThreadFromMessage = async (
+	token: string,
+	chatId: string,
+	messageId: string,
+	title?: string
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${chatId}/threads`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		},
+		body: JSON.stringify({
+			message_id: messageId,
+			...(title ? { title } : {})
+		})
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = getErrorDetail(err);
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const getThreadTree = async (token: string, chatId: string) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${chatId}/threads/tree`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			...(token && { authorization: `Bearer ${token}` })
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = getErrorDetail(err);
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
 export const cloneSharedChatById = async (token: string, id: string) => {
 	let error = null;
 
@@ -1409,10 +1474,10 @@ export const resolveChatMessageToolCall = async (
 	return res;
 };
 
-export const deleteChatById = async (token: string, id: string) => {
+export const deleteChatById = async (token: string, id: string, cascade: boolean = false) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}`, {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}${cascade ? '?cascade=true' : ''}`, {
 		method: 'DELETE',
 		headers: {
 			Accept: 'application/json',
@@ -1428,7 +1493,7 @@ export const deleteChatById = async (token: string, id: string) => {
 			return json;
 		})
 		.catch((err) => {
-			error = err.detail;
+			error = getErrorDetail(err);
 
 			console.error(err);
 			return null;

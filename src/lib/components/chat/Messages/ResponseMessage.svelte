@@ -46,6 +46,7 @@
 	import RateComment from './RateComment.svelte';
 	import WebSearchResults from './ResponseMessage/WebSearchResults.svelte';
 	import Sparkles from '$lib/components/icons/Sparkles.svelte';
+	import Branch from '$lib/components/icons/Branch.svelte';
 
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 
@@ -162,6 +163,7 @@
 	export let continueResponse: Function;
 	export let regenerateResponse: Function;
 	export let forkHandler: Function | null = null;
+	export let startThreadHandler: Function | null = null;
 
 	export let addMessages: Function;
 	export let onToolCallResolved: Function = () => {};
@@ -1519,6 +1521,22 @@
 													<path d="M9 12C12.5 12 12.5 17 16 17H20" />
 													<path d="M17 14L20 17L17 20" />
 												</svg>
+											</button>
+										</Tooltip>
+									{/if}
+
+									{#if message.done && !readOnly && startThreadHandler}
+										<Tooltip content={$i18n.t('Start side thread')} placement="bottom">
+											<button
+												aria-label={$i18n.t('Start side thread')}
+												class="{isLastMessage || ($settings?.highContrastMode ?? false)
+													? 'visible'
+													: 'hover-reveal'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+												on:click={() => {
+													startThreadHandler?.(message.id);
+												}}
+											>
+												<Branch className="w-4 h-4" strokeWidth="1.8" />
 											</button>
 										</Tooltip>
 									{/if}
