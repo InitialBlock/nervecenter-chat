@@ -285,6 +285,35 @@ async def expand_ids_with_live_children(ids: set[str], fetch_new_child_ids, max_
     return expanded
 
 
+async def revalidate_thread_anchor(thread_id: str, fetch_parent, fetch_branch_message, delete_thread) -> str | None:
+    """Re-check a freshly inserted thread row's anchor; undo the insert if gone.
+
+    Create side of a two-sided invariant with the cascade delete: a delete
+    that *starts* after the thread insert commits re-expands its id set
+    inside the delete transaction (:func:`expand_ids_with_live_children`)
+    and sweeps the new row up; a delete that *commits* between the create
+    endpoint's validations and its insert is caught here — the anchor
+    (parent chat / branch message) is re-checked once the new row is
+    visible, and the row is removed if the anchor vanished. Together the
+    two sides ensure a thread row never silently outlives its anchor.
+
+    Pure over injected async callables so it is testable without a DB:
+    ``fetch_parent()`` returns the parent chat or ``None``;
+    ``fetch_branch_message(parent)`` returns the branch message dict or
+    ``None``; ``delete_thread(thread_id)`` removes the just-inserted row.
+    Returns ``'chat'`` or ``'message'`` naming what vanished (after
+    deleting the thread row), or ``None`` when the anchor still holds.
+    """
+    parent = await fetch_parent()
+    if parent is None:
+        await delete_thread(thread_id)
+        return 'chat'
+    if await fetch_branch_message(parent) is None:
+        await delete_thread(thread_id)
+        return 'message'
+    return None
+
+
 def _ids_removed_by_delete(message_id: str, message: dict, messages: dict) -> set[str]:
     """Ids removed when *message_id* is deleted from a history messages map.
 
@@ -2719,6 +2748,28 @@ class ChatTable:
             count = result.scalar()
 
             log.info("Count of chats for folders '%s': %s", folder_ids, count)
+            return count
+
+    async def count_all_chats_by_folder_ids_and_user_id(
+        self, folder_ids: list[str], user_id: str, db: AsyncSession | None = None
+    ) -> int:
+        """Unfiltered count of every chat row in *folder_ids* for *user_id*.
+
+        Unlike :meth:`count_chats_by_folder_ids_and_user_id`, this does NOT
+        apply :func:`visible_chat_filter`, so thread chats and internal chats
+        are included. Use it for authorization gates that must count what
+        deletion actually removes (``delete_chats_by_user_id_and_folder_id``
+        deletes all rows regardless of visibility), not for listing surfaces.
+        """
+        if not folder_ids:
+            return 0
+
+        async with get_async_db_context(db) as session:
+            stmt = select(func.count(Chat.id)).filter(Chat.user_id == user_id, Chat.folder_id.in_(folder_ids))
+            result = await session.execute(stmt)
+            count = result.scalar()
+
+            log.info("Total count of chats (incl. threads) for folders '%s': %s", folder_ids, count)
             return count
 
     async def delete_tag_by_id_and_user_id_and_tag_name(

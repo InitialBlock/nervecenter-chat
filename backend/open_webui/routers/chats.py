@@ -28,6 +28,7 @@ from open_webui.models.chats import (
     MessageStats,
     chat_search_content_query,
     chat_search_terms,
+    revalidate_thread_anchor,
     thread_title_from_message,
 )
 from open_webui.models.config import Config
@@ -1725,12 +1726,16 @@ async def create_chat_thread(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    history = (chat.chat or {}).get('history') or {}
-    message = (history.get('messages') or {}).get(form_data.message_id)
-    if not isinstance(message, dict):
-        # Chats migrated to the chat_message table may keep a thin JSON blob.
-        message = await Chats.get_message_by_id_and_message_id(id, form_data.message_id)
-    if not isinstance(message, dict):
+    async def resolve_branch_message(parent_chat) -> dict | None:
+        history = (parent_chat.chat or {}).get('history') or {}
+        message = (history.get('messages') or {}).get(form_data.message_id)
+        if not isinstance(message, dict):
+            # Chats migrated to the chat_message table may keep a thin JSON blob.
+            message = await Chats.get_message_by_id_and_message_id(id, form_data.message_id)
+        return message if isinstance(message, dict) else None
+
+    message = await resolve_branch_message(chat)
+    if message is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='message not found')
 
     title = (form_data.title or '').strip() or thread_title_from_message(message)
@@ -1759,6 +1764,26 @@ async def create_chat_thread(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=ERROR_MESSAGES.DEFAULT(),
         )
+
+    # Create/delete race guard — the create side of a two-sided invariant:
+    # the cascade delete re-expands its id set inside its own transaction
+    # (expand_ids_with_live_children), so a delete starting after this insert
+    # commits sweeps the new row up; a delete that committed between the
+    # validations above and the insert is caught here by re-checking the
+    # parent/message and removing the just-inserted row.
+    vanished = await revalidate_thread_anchor(
+        thread.id,
+        lambda: Chats.get_chat_by_id_and_user_id(id, user.id, db=db),
+        resolve_branch_message,
+        lambda thread_id: Chats.delete_chat_by_id_and_user_id(thread_id, user.id, db=db),
+    )
+    if vanished == 'chat':
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+    if vanished == 'message':
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='message not found')
 
     await publish_event(
         request,

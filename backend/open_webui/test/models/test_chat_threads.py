@@ -21,6 +21,7 @@ from open_webui.models.chats import (  # noqa: E402
     ChatTable,
     collect_thread_subtree_ids,
     expand_ids_with_live_children,
+    revalidate_thread_anchor,
     thread_title_from_message,
 )
 
@@ -266,3 +267,68 @@ def test_expand_does_not_mutate_input():
     fetcher = make_adjacency_fetcher({'a': ['b']})
     asyncio.run(expand_ids_with_live_children(ids, fetcher))
     assert ids == {'a'}
+
+
+# ---------------------------------------------------------------------------
+# revalidate_thread_anchor — post-insert revalidation closing the other side
+# of the create/delete race (a delete committing between the create endpoint's
+# validations and its insert)
+# ---------------------------------------------------------------------------
+
+
+def make_anchor_env(parent, message, deleted=None):
+    """Injectable fetchers over a static parent/message pair (fake DB reads)."""
+    deleted = deleted if deleted is not None else []
+
+    async def fetch_parent():
+        return parent
+
+    async def fetch_branch_message(fetched_parent):
+        assert fetched_parent is parent  # helper must check against the re-fetch
+        return message
+
+    async def delete_thread(thread_id):
+        deleted.append(thread_id)
+
+    return fetch_parent, fetch_branch_message, delete_thread, deleted
+
+
+def test_revalidate_anchor_holds_keeps_row():
+    fetchers = make_anchor_env(parent={'id': 'p'}, message={'id': 'm'})
+    fetch_parent, fetch_branch_message, delete_thread, deleted = fetchers
+    result = asyncio.run(revalidate_thread_anchor('t1', fetch_parent, fetch_branch_message, delete_thread))
+    assert result is None
+    assert deleted == []
+
+
+def test_revalidate_parent_vanished_removes_row():
+    fetch_parent, fetch_branch_message, delete_thread, deleted = make_anchor_env(parent=None, message={'id': 'm'})
+    result = asyncio.run(revalidate_thread_anchor('t1', fetch_parent, fetch_branch_message, delete_thread))
+    assert result == 'chat'
+    assert deleted == ['t1']
+
+
+def test_revalidate_message_vanished_removes_row():
+    fetch_parent, fetch_branch_message, delete_thread, deleted = make_anchor_env(parent={'id': 'p'}, message=None)
+    result = asyncio.run(revalidate_thread_anchor('t1', fetch_parent, fetch_branch_message, delete_thread))
+    assert result == 'message'
+    assert deleted == ['t1']
+
+
+def test_revalidate_parent_vanished_skips_message_lookup():
+    # With the parent gone there is no history to consult; the helper must not
+    # call the message fetcher on a missing parent.
+    async def fetch_parent():
+        return None
+
+    async def fetch_branch_message(fetched_parent):
+        raise AssertionError('message fetcher must not run when the parent is gone')
+
+    deleted = []
+
+    async def delete_thread(thread_id):
+        deleted.append(thread_id)
+
+    result = asyncio.run(revalidate_thread_anchor('t1', fetch_parent, fetch_branch_message, delete_thread))
+    assert result == 'chat'
+    assert deleted == ['t1']
